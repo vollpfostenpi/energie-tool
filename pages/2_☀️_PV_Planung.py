@@ -5,187 +5,200 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # --- SEITENKONFIGURATION ---
-st.set_page_config(page_title="Energy Architect Pro 2026", page_icon="☀️", layout="wide")
+st.set_page_config(page_title="PV-Expert PRO 2026", page_icon="☀️", layout="wide")
 
-# Custom UI Styling
+# Custom Styling
 st.markdown("""
     <style>
-    .stMetric { background-color: #f0f4f8; padding: 15px; border-radius: 12px; border: 1px solid #d1d9e6; }
+    .stMetric { background-color: #f8f9fa; padding: 15px; border-radius: 12px; border: 1px solid #dee2e6; }
     .stAlert { border-radius: 12px; }
-    .section-box { padding: 20px; border-radius: 15px; background-color: #ffffff; border: 1px solid #e2e8f0; margin-bottom: 20px; }
+    .hardware-box { background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e2e8f0; margin-bottom: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("☀️ Energy Architect & ROI-Prozessor (Edition 2026)")
+st.title("☀️ Smart Energy Architect & Business Simulator")
 
-# --- SIDEBAR: NETZ & GLOBALE DATEN ---
+# --- SIDEBAR: GLOBALE PARAMETER ---
 with st.sidebar:
     st.header("🔌 Netz & Infrastruktur")
-    grid_limit_kva = st.number_input("Max. Netzanschluss (kVA)", 10, 5000, 43, help="Technischer Flaschenhals des Standorts")
-    has_imsys = st.toggle("iMSys vorhanden (Smart Meter)", value=True, help="Ohne iMSys greift die 60%-Regelung.")
+    grid_limit_kva = st.number_input("Max. Netzanschlussleistung (kVA)", 10, 10000, 43)
     
     st.divider()
-    st.header("🎯 Modulauswahl")
+    st.header("🎯 Modul-Auswahl")
     show_pv = st.checkbox("Photovoltaik (PV)", value=True)
     show_storage = st.checkbox("Batteriespeicher (BESS)", value=True)
-    show_heat = st.checkbox("Wärmepumpe (Sektorenkopplung)", value=True)
-    show_mobility = st.checkbox("Fuhrpark & THG", value=True)
+    show_mobility = st.checkbox("Fuhrpark & Laden", value=True)
+    show_heat = st.checkbox("Sektorenkopplung Wärme", value=False)
     show_arbitrage = st.checkbox("Arbitrage Handel", value=False)
     
     st.divider()
     st.header("💰 Marktdaten")
     strompreis_netz = st.slider("Bezugspreis (ct/kWh)", 15, 60, 32)
-    einspeise_verg = st.number_input("EEG Vergütung (ct/kWh)", 5.0, 15.0, 8.1)
+    einspeise_verg_ueberschuss = st.number_input("EEG Überschuss (ct/kWh)", 0.0, 15.0, 8.2)
+    einspeise_verg_voll = st.number_input("EEG Volleinspeisung (ct/kWh)", 0.0, 20.0, 13.0)
 
 # --- SESSION STATE INITIALISIERUNG ---
-for key in ['daecher', 'lade_punkte', 'fuhrpark']:
+for key in ['daecher', 'pv_module', 'pv_wr', 'bat_systeme', 'lade_punkte', 'fuhrpark']:
     if key not in st.session_state: st.session_state[key] = []
 
 # Tabs Setup
 tabs_labels = ["📊 ROI & Netz-Check"]
 if show_pv: tabs_labels.append("🏗️ PV-Planung")
 if show_storage: tabs_labels.append("🔋 Speicher")
-if show_heat: tabs_labels.append("🔥 Wärme/Kälte")
-if show_mobility: tabs_labels.append("🚗 Mobilität & THG")
+if show_mobility: tabs_labels.append("🚗 Mobilität & Laden")
 if show_arbitrage: tabs_labels.append("📈 Arbitrage")
 tabs = st.tabs(tabs_labels)
 
-# Globale Variablen
+# Globale Berechnungsvariablen
 total_kwp = 0.0
 total_storage_kwh = 0.0
+total_lp_power_ac = 0.0
+total_lp_power_dc = 0.0
 thg_revenue = 0.0
-wp_strombedarf = 0.0
-imsys_costs = 0.0
-arb_rev = 0.0
+pv_betriebsmodus = "Eigenverbrauch"
 
 # --- TAB: PV-PLANUNG ---
 if show_pv:
     with tabs[tabs_labels.index("🏗️ PV-Planung")]:
         st.header("🏗️ PV-Projektierung")
-        if st.button("➕ Neues Dach"):
-            st.session_state.daecher.append({'typ': 'Satteldach', 'azimut': 0, 'kwp': 15.0})
         
-        for i, dach in enumerate(st.session_state.daecher):
-            with st.container(border=True):
-                c1, c2, c3, c4 = st.columns([2,2,2,1])
-                dach['typ'] = c1.selectbox(f"Dachtyp #{i+1}", ["Satteldach", "Flachdach", "Ost-West"], key=f"dt_{i}")
-                dach['azimut'] = c2.slider(f"Ausrichtung #{i+1} (Süd=0)", -180, 180, int(dach['azimut']), key=f"da_{i}")
-                dach['kwp'] = c3.number_input(f"Leistung (kWp) #{i+1}", 0.0, 2000.0, value=float(dach['kwp']), key=f"dp_{i}")
-                if c4.button("🗑️", key=f"dd_{i}"): st.session_state.daecher.pop(i); st.rerun()
+        # Logik: Nur PV Prüfung
+        only_pv = show_pv and not (show_storage or show_mobility or show_heat or show_arbitrage)
+        if only_pv:
+            st.info("💡 Da nur PV geplant wird: Wählen Sie das Betriebskonzept.")
+            pv_betriebsmodus = st.radio("Betriebsmodus", ["Eigenverbrauch (Überschusseinspeisung)", "Volleinspeisung"], horizontal=True)
         
+        # Dachflächen
+        st.subheader("🏠 Dachflächen")
+        if st.button("➕ Dachfläche hinzufügen"):
+            st.session_state.daecher.append({'kwp': 10.0})
+        for i, d in enumerate(st.session_state.daecher):
+            c1, c2 = st.columns([4,1])
+            d['kwp'] = c1.number_input(f"Leistung Dach {i+1} (kWp)", 0.0, 5000.0, d['kwp'], key=f"dkwp_{i}")
+            if c2.button("🗑️", key=f"ddel_{i}"): st.session_state.daecher.pop(i); st.rerun()
         total_kwp = sum(d['kwp'] for d in st.session_state.daecher)
-        
-        # iMSys Kostenkalkulation 2026
-        if total_kwp > 7:
-            imsys_costs = 50.0 if total_kwp <= 15 else (110.0 if total_kwp <= 25 else 140.0)
-            imsys_costs += 50.0 # Steuerbox-Zusatz
-            st.info(f"📋 Messstellenbetrieb (iMSys + Steuerbox): **{imsys_costs} €/Jahr**")
 
-        st.subheader("📄 Komponenten-Details")
-        with st.container(border=True):
-            st.text_input("Hersteller / Modultyp", placeholder="z.B. Jinko Tiger Neo")
-            st.file_uploader("Datenblatt Module", type=["pdf"], key="pdf_pv")
+        # Hardware: Module & Wechselrichter
+        st.divider()
+        st.subheader("🧩 PV-Komponenten")
+        
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.markdown("**Module**")
+            if st.button("➕ Modul-Typ hinzufügen"): st.session_state.pv_module.append({'typ': '', 'anz': 0, 'w': 440})
+            for i, m in enumerate(st.session_state.pv_module):
+                with st.container(border=True):
+                    m['typ'] = st.text_input(f"Modul-Hersteller/Typ #{i+1}", m['typ'], key=f"m_t_{i}")
+                    m['anz'] = st.number_input(f"Anzahl #{i+1}", 0, 10000, m['anz'], key=f"m_a_{i}")
+                    m['w'] = st.number_input(f"Leistung (Wp) #{i+1}", 0, 700, m['w'], key=f"m_w_{i}")
+                    if st.button(f"🗑️ Modul {i+1}", key=f"m_d_{i}"): st.session_state.pv_module.pop(i); st.rerun()
+
+        with col_m2:
+            st.markdown("**Wechselrichter**")
+            if st.button("➕ Wechselrichter hinzufügen"): st.session_state.pv_wr.append({'typ': '', 'anz': 0, 'p': 10.0})
+            for i, w in enumerate(st.session_state.pv_wr):
+                with st.container(border=True):
+                    w['typ'] = st.text_input(f"WR-Hersteller/Typ #{i+1}", w['typ'], key=f"w_t_{i}")
+                    w['anz'] = st.number_input(f"Anzahl #{i+1}", 0, 100, w['anz'], key=f"w_a_{i}")
+                    w['p'] = st.number_input(f"AC-Leistung (kW) #{i+1}", 0.0, 500.0, w['p'], key=f"w_p_{i}")
+                    if st.button(f"🗑️ WR {i+1}", key=f"w_d_{i}"): st.session_state.pv_wr.pop(i); st.rerun()
 
 # --- TAB: SPEICHER ---
 if show_storage:
     with tabs[tabs_labels.index("🔋 Speicher")]:
         st.header("🔋 Batteriespeicher (BESS)")
-        c_b1, c_b2 = st.columns(2)
-        total_storage_kwh = c_b1.number_input("Nennkapazität (kWh)", 0.0, 5000.0, 20.0)
-        c_rate = c_b2.number_input("C-Rate (Leistungsfaktor)", 0.1, 2.0, 1.0)
-        storage_p = total_storage_kwh * c_rate
-        st.metric("Verfügbare Leistung", f"{storage_p:.1f} kW")
+        if st.button("➕ Speichersystem hinzufügen"): 
+            st.session_state.bat_systeme.append({'typ': '', 'kwh': 10.0, 'zyklen': 6000, 'dod': 90, 'c_rate': 1.0})
         
-        st.subheader("📄 Speicher-Hardware")
-        with st.container(border=True):
-            st.text_input("Hersteller / Modell Speicher", placeholder="z.B. BYD Battery-Box")
-            st.file_uploader("Datenblatt Speicher", type=["pdf"], key="pdf_bat")
+        for i, b in enumerate(st.session_state.bat_systeme):
+            with st.container(border=True):
+                c1, c2, c3 = st.columns(3)
+                b['typ'] = c1.text_input(f"System-Name #{i+1}", b['typ'], key=f"b_t_{i}")
+                b['kwh'] = c2.number_input(f"Kapazität (kWh) #{i+1}", 0.0, 5000.0, b['kwh'], key=f"b_k_{i}")
+                b['c_rate'] = c3.number_input(f"C-Rate (Leistung)", 0.1, 2.0, b['c_rate'], key=f"b_c_{i}")
+                
+                c4, c5, c6 = st.columns(3)
+                b['zyklen'] = c4.number_input("Garantierte Zyklen", 1000, 15000, b['zyklen'], key=f"b_z_{i}")
+                b['dod'] = c5.slider("Entladetiefe (DoD %)", 50, 100, b['dod'], key=f"b_d_{i}")
+                if c6.button("🗑️ Löschen", key=f"b_del_{i}"): st.session_state.bat_systeme.pop(i); st.rerun()
+        
+        total_storage_kwh = sum(b['kwh'] for b in st.session_state.bat_systeme)
 
-# --- TAB: WÄRME/KÄLTE ---
-if show_heat:
-    with tabs[tabs_labels.index("🔥 Wärme/Kälte")]:
-        st.header("🔥 Sektorenkopplung Wärmepumpe")
-        with st.container(border=True):
-            h1, h2, h3 = st.columns(3)
-            waermebedarf = h1.number_input("Heizbedarf (kWh/a)", 0, 500000, 20000)
-            jaz_heiz = h2.number_input("Jahresarbeitszahl (Heizen)", 1.0, 6.0, 3.8)
-            wp_strom_heiz = waermebedarf / jaz_heiz
-            
-            show_cooling = st.toggle("Kühlung im Sommer integrieren", value=True)
-            wp_strom_kuehl = 0
-            if show_cooling:
-                kuehlbedarf = st.number_input("Kühlbedarf (kWh/a)", 0, 100000, 5000)
-                jaz_kuehl = st.number_input("EER (Wirkungsgrad Kühlen)", 1.0, 6.0, 3.0)
-                wp_strom_kuehl = kuehlbedarf / jaz_kuehl
-            
-            wp_strombedarf = wp_strom_heiz + wp_strom_kuehl
-            st.metric("Gesamt-Strombedarf WP", f"{wp_strombedarf:,.0f} kWh/a")
-
-# --- TAB: MOBILITÄT & THG ---
+# --- TAB: MOBILITÄT & LADEN ---
 if show_mobility:
-    with tabs[tabs_labels.index("🚗 Mobilität & THG")]:
-        st.header("🚗 Fuhrpark & THG-Management")
+    with tabs[tabs_labels.index("🚗 Mobilität & Laden")]:
+        st.header("🚗 Ladeinfrastruktur & Fuhrpark")
         
-        thg_mode = st.radio("THG-Quote", ["Referenz 2026", "Manuell"], horizontal=True)
-        t1, t2, t3 = st.columns(3)
-        v_pkw, v_lkw, v_bus = (115.0, 420.0, 480.0) if thg_mode == "Referenz 2026" else (
-            t1.number_input("PKW (€)", 0, 500, 110),
-            t2.number_input("LKW (€)", 0, 2000, 400),
-            t3.number_input("Bus (€)", 0, 2000, 450)
-        )
+        # Ladeinfrastruktur AC/DC
+        st.subheader("🔌 Ladepunkte (AC & DC)")
+        if st.button("➕ Ladepunkt hinzufügen"):
+            st.session_state.lade_punkte.append({'art': 'AC', 'p': 11.0, 'anz': 1})
+        
+        for i, lp in enumerate(st.session_state.lade_punkte):
+            with st.container(border=True):
+                l1, l2, l3, l4 = st.columns([2,1,1,1])
+                lp['art'] = l1.selectbox(f"Typ #{i+1}", ["AC (Wallbox)", "DC (Schnelllader)"], key=f"lp_a_{i}")
+                lp['p'] = l2.number_input(f"kW pro LP #{i+1}", 1.0, 400.0, lp['p'], key=f"lp_p_{i}")
+                lp['anz'] = l3.number_input(f"Anzahl #{i+1}", 1, 100, lp['anz'], key=f"lp_n_{i}")
+                if l4.button("🗑️", key=f"lp_d_{i}"): st.session_state.lade_punkte.pop(i); st.rerun()
+                
+                if "AC" in lp['art']: total_lp_power_ac += (lp['p'] * lp['anz'])
+                else: total_lp_power_dc += (lp['p'] * lp['anz'])
 
-        if st.button("➕ Fahrzeuggruppe"):
-            st.session_state.fuhrpark.append({'art': 'PKW (M1)', 'anz': 1})
-            
+        # THG Quote & Fuhrpark
+        st.divider()
+        st.subheader("🚐 Fuhrpark & THG-Quote")
+        if st.button("➕ Fahrzeuggruppe hinzufügen"):
+            st.session_state.fuhrpark.append({'art': 'PKW', 'anz': 1})
         for i, f in enumerate(st.session_state.fuhrpark):
             with st.container(border=True):
                 f1, f2, f3 = st.columns([2,1,1])
-                f['art'] = f1.selectbox(f"Klasse #{i+1}", ["PKW (M1)", "LKW (N1-N3)", "Busse (M2/M3)"], key=f"fa_{i}")
-                f['anz'] = f2.number_input(f"Anzahl #{i+1}", 1, 500, value=f['anz'], key=f"fan_{i}")
-                if f3.button("🗑️", key=f"fdel_{i}"): st.session_state.fuhrpark.pop(i); st.rerun()
+                f['art'] = f1.selectbox(f"Typ #{i+1}", ["PKW", "LKW", "Busse"], key=f"f_a_{i}")
+                f['anz'] = f2.number_input(f"Anzahl", 1, 500, f['anz'], key=f"f_n_{i}")
+                if f3.button("🗑️", key=f"f_d_{i}"): st.session_state.fuhrpark.pop(i); st.rerun()
                 
-                thg_revenue += (f['anz'] * (v_pkw if "PKW" in f['art'] else (v_lkw if "LKW" in f['art'] else v_bus)))
-        
-        st.subheader("📄 Ladeinfrastruktur-Hardware")
-        with st.container(border=True):
-            st.text_input("Hersteller / Typ Wallbox")
-            st.file_uploader("Datenblatt Ladestation", type=["pdf"], key="pdf_lp")
-
-# --- TAB: ARBITRAGE ---
-if show_arbitrage:
-    with tabs[tabs_labels.index("📈 Arbitrage")]:
-        st.header("📈 Markt-Handel")
-        arb_spread = st.number_input("Ø Preis-Spread (ct/kWh)", 0.0, 40.0, 14.5)
-        arb_rev = (total_storage_kwh * 0.9 * (arb_spread/100) * 250)
-        st.metric("Arbitrage-Deckungsbeitrag", f"{arb_rev:,.2f} €/a")
+                # THG Erlös (Referenz 2026)
+                thg_val = {"PKW": 115, "LKW": 420, "Busse": 480}
+                thg_revenue += (f['anz'] * thg_val[f['art']])
 
 # --- TAB 1: ROI & NETZ-CHECK ---
 with tabs[0]:
-    st.header("📋 Business Case")
+    st.header("📊 Wirtschaftlichkeit & Netz-Check")
     
+    # NETZANSCHLUSS CHECK
+    total_peak = max(total_kwp, (total_lp_power_ac + total_lp_power_dc) * 0.6)
+    with st.container(border=True):
+        st.subheader("🔌 Netzanschluss-Kapazität")
+        nc1, nc2, nc3 = st.columns(3)
+        nc1.metric("Anschlussleistung", f"{grid_limit_kva} kVA")
+        nc2.metric("Peak-Last (Sim.)", f"{total_peak:.1f} kW")
+        auslastung = (total_peak / grid_limit_kva) * 100
+        nc3.metric("Auslastung", f"{auslastung:.1f} %")
+        if total_peak > grid_limit_kva: st.error("Netzanschluss kritisch!")
+        else: st.success("Netzanschluss OK")
+
+    # ROI RECHNUNG
     pv_ertrag = total_kwp * 1020
-    if not has_imsys: pv_ertrag *= 0.93 # 60% Regelung Verlust
-    
-    # EV-Quote Simulation
-    ev_rate = 0.3 + (0.35 if total_storage_kwh > 0 else 0) + (0.15 if show_heat else 0) + (0.10 if show_mobility else 0)
-    ev_rate = min(ev_rate, 0.95)
-    
-    annual_saving = (pv_ertrag * ev_rate * (strompreis_netz/100)) + \
-                    (pv_ertrag * (1-ev_rate) * (einspeise_verg/100)) + \
-                    thg_revenue + arb_rev - imsys_costs
-
-    invest = (total_kwp * 1150) + (total_storage_kwh * 550)
-    
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Investment", f"{invest:,.0f} €")
-    c2.metric("Einsparung/Erlös p.a.", f"{annual_saving:,.0f} €")
-    c3.metric("ROI", f"{invest/annual_saving if annual_saving > 0 else 0:.1f} Jahre")
-
-    st.divider()
-    st.subheader("🔌 Netzanschluss-Prüfung")
-    peak_in = total_kwp * 0.85
-    if peak_in > grid_limit_kva:
-        st.error(f"❌ Netzanschluss kritisch! Peak ({peak_in:.1f} kW) > Limit ({grid_limit_kva} kVA)")
+    if "Volleinspeisung" in pv_betriebsmodus and only_pv:
+        benefit = pv_ertrag * (einspeise_verg_voll / 100)
     else:
-        st.success(f"✅ Netzanschluss OK (Auslastung: {(peak_in/grid_limit_kva)*100:.1f}%)")
+        # Eigenverbrauch (Dynamisch)
+        ev_rate = 0.3 + (0.35 if total_storage_kwh > 0 else 0) + (0.15 if show_mobility else 0)
+        ev_rate = min(ev_rate, 0.95)
+        benefit = (pv_ertrag * ev_rate * (strompreis_netz/100)) + \
+                  (pv_ertrag * (1-ev_rate) * (einspeise_verg_ueberschuss/100)) + thg_revenue
+
+    invest = (total_kwp * 1150) + (total_storage_kwh * 550) + (len(st.session_state.lade_punkte) * 2500)
+    
+    st.divider()
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Investment", f"{invest:,.0f} €")
+    r2.metric("Erlös/Ersparnis p.a.", f"{benefit:,.2f} €")
+    r3.metric("ROI", f"{invest/benefit if benefit > 0 else 0:.1f} Jahre")
+
+    # Amortisationsgraph
+    x = np.arange(21)
+    y = [-invest + (benefit * i) for i in x]
+    fig = px.line(x=x, y=y, title="Kumulierter Cashflow (20 Jahre)", labels={'x':'Jahre', 'y':'€'})
+    fig.add_hline(y=0, line_dash="dash", line_color="red")
+    st.plotly_chart(fig, use_container_width=True)
