@@ -7,4 +7,4 @@ openpyxl
 Pillow
 reportlab
 pytest
-altair==5.4.1
+altair==4.2.2
