@@ -5,106 +5,150 @@ import base64
 import shutil
 from datetime import datetime
 
-# SYSTEM-PFADE
-CONFIG_DIR = "config"
-PROJECTS_DIR = "projects"
-MASTER_CONFIG = os.path.join(CONFIG_DIR, "installer_master.json")
+# =================================================================
+# 1. SYSTEM-KONFIGURATION & PFADE
+# =================================================================
+BASE_DIR = os.getcwd()
+PROJECTS_ROOT = os.path.join(BASE_DIR, "projects")
+CONFIG_ROOT = os.path.join(BASE_DIR, "config")
+INSTALLER_CONFIG = os.path.join(CONFIG_ROOT, "installer_master.json")
 
-for d in [CONFIG_DIR, PROJECTS_DIR]:
-    os.makedirs(d, exist_ok=True)
+for path in [PROJECTS_ROOT, CONFIG_ROOT]:
+    os.makedirs(path, exist_ok=True)
 
 st.set_page_config(page_title="Energy Architect Pro", layout="wide", page_icon="🛡️")
 
-# --- HELPER: LOGO & DATEN ---
-def get_installer():
-    if os.path.exists(MASTER_CONFIG):
-        with open(MASTER_CONFIG, "r") as f: return json.load(f)
-    return {"name": "", "anschrift": "", "logo": None, "web": "", "email": ""}
+# =================================================================
+# 2. HILFSFUNKTIONEN
+# =================================================================
 
-def save_installer(data):
-    with open(MASTER_CONFIG, "w") as f: json.dump(data, f)
+def load_installer_data():
+    if os.path.exists(INSTALLER_CONFIG):
+        with open(INSTALLER_CONFIG, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"firma": "", "anschrift": "", "logo_base64": None}
 
-# --- UI NAVIGATION ---
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/807/807351.png", width=80)
-    st.title("Enterprise Suite")
-    menu = st.radio("Navigation", ["Dashboard & Projekte", "Installateur-Stammdaten", "System-Archiv"])
-    st.divider()
-    if st.session_state.get("active_slug"):
-        st.success(f"Aktiv: {st.session_state['active_slug']}")
-        if st.button("Projekt schließen"):
-            st.session_state["active_slug"] = None
-            st.rerun()
+def save_installer_data(data):
+    with open(INSTALLER_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
 
-# --- MODUL: INSTALLATEUR-STAMMDATEN ---
-if menu == "Installateur-Stammdaten":
-    st.header("🏢 Unternehmensprofil & Branding")
-    inst = get_installer()
-    col1, col2 = st.columns([1, 2])
+# =================================================================
+# 3. UI - NAVIGATION
+# =================================================================
+
+st.title("🛡️ Enterprise Energy Management")
+
+tab_explorer, tab_installer = st.tabs(["📂 PROJEKT-VERWALTUNG", "🏢 INSTALLATEUR-STAMMDATEN"])
+
+# --- TAB: INSTALLATEUR-STAMMDATEN ---
+with tab_installer:
+    st.header("Firmenprofil & Branding")
+    inst = load_installer_data()
+    col_l, col_r = st.columns([1, 2])
+    with col_l:
+        up_logo = st.file_uploader("Logo hochladen", type=["png", "jpg", "jpeg"])
+        if up_logo:
+            inst["logo_base64"] = base64.b64encode(up_logo.read()).decode()
+        if inst["logo_base64"]:
+            st.image(base64.b64decode(inst["logo_base64"]), width=200)
+    with col_r:
+        inst["firma"] = st.text_input("Firmenname", inst["firma"])
+        inst["anschrift"] = st.text_area("Anschrift", inst["anschrift"])
+    if st.button("💾 STAMMDATEN SPEICHERN"):
+        save_installer_data(inst)
+        st.success("Gespeichert!")
+
+# --- TAB: PROJEKT-VERWALTUNG (EXPLORER / IMPORT / LÖSCHEN) ---
+with tab_explorer:
+    col_head, col_import = st.columns([2, 1])
+    with col_head:
+        st.header("Vorhandene Projekte")
     
-    with col1:
-        st.subheader("Branding")
-        logo_up = st.file_uploader("Firmenlogo (High-Res)", type=["png", "jpg", "svg"])
-        if logo_up:
-            inst["logo"] = base64.b64encode(logo_up.read()).decode()
-        if inst["logo"]:
-            st.image(base64.b64decode(inst["logo"]), use_container_width=True)
-            if st.button("Logo entfernen"):
-                inst["logo"] = None
-                save_installer(inst)
+    with col_import:
+        st.subheader("📥 Projekt Import")
+        uploaded_file = st.file_uploader("Projekt-Datei (.json) auswählen", type=["json"])
+        if uploaded_file is not None:
+            try:
+                import_data = json.load(uploaded_file)
+                p_name = import_data['metadata']['projekt_id']
+                slug = p_name.lower().replace(" ", "_")
+                p_path = os.path.join(PROJECTS_ROOT, slug)
+                os.makedirs(p_path, exist_ok=True)
+                with open(os.path.join(p_path, "state.json"), "w", encoding="utf-8") as f:
+                    json.dump(import_data, f, indent=4)
+                st.success(f"Projekt '{p_name}' erfolgreich importiert!")
                 st.rerun()
+            except Exception as e:
+                st.error(f"Fehler beim Import: {e}")
 
-    with col2:
-        st.subheader("Kontaktdaten für Berichte")
-        inst["name"] = st.text_input("Firmenname", inst["name"])
-        inst["anschrift"] = st.text_area("Vollständige Anschrift", inst["anschrift"])
-        inst["email"] = st.text_input("Zentrale E-Mail", inst["email"])
-        inst["web"] = st.text_input("Webseite (URL)", inst["web"])
-        if st.button("💾 Stammdaten global sichern"):
-            save_installer(inst)
-            st.toast("Firmendaten aktualisiert!")
+    st.divider()
 
-# --- MODUL: PROJEKT-MANAGER ---
-elif menu == "Dashboard & Projekte":
-    st.header("📂 Projekt-Management")
-    t1, t2 = st.tabs(["Projektliste", "🆕 Neue Erfassung"])
+    # Liste der Projekte
+    projs = [d for d in os.listdir(PROJECTS_ROOT) if os.path.isdir(os.path.join(PROJECTS_ROOT, d))]
     
-    with t1:
-        projs = [d for d in os.listdir(PROJECTS_DIR) if os.path.isdir(os.path.join(PROJECTS_DIR, d))]
-        if not projs: st.info("Keine Projekte vorhanden.")
-        for p in projs:
-            p_file = os.path.join(PROJECTS_DIR, p, "state.json")
-            if os.path.exists(p_file):
-                with open(p_file, "r") as f: data = json.load(f)
-                with st.container(border=True):
-                    c1, c2, c3 = st.columns([4, 1, 1])
-                    c1.subheader(data['metadata']['name'])
-                    c1.caption(f"Typ: {data['metadata']['type']} | Status: {data['metadata']['status']}")
-                    if c2.button("Öffnen", key=f"o_{p}"):
-                        st.session_state["active_slug"] = p
-                        st.session_state["projekt_daten"] = data
-                        st.switch_page("pages/2_🏗️_Planung.py")
-                    if c3.button("Löschen", key=f"d_{p}"):
-                        shutil.rmtree(os.path.join(PROJECTS_DIR, p))
+    if not projs:
+        st.info("Keine Projekte gefunden. Erstelle ein neues oder importiere eins.")
+    
+    for p in projs:
+        state_path = os.path.join(PROJECTS_ROOT, p, "state.json")
+        if os.path.exists(state_path):
+            with open(state_path, "r", encoding="utf-8") as f:
+                p_data = json.load(f)
+            
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+                
+                c1.subheader(f"📄 {p_data['metadata']['projekt_id']}")
+                c1.write(f"**Kunde:** {p_data['kunde']['name']} | **Erstellt:** {p_data['metadata']['erstellt_am']}")
+                
+                # Button: Öffnen
+                if c2.button("📂 ÖFFNEN", key=f"open_{p}", use_container_width=True):
+                    st.session_state["active_slug"] = p
+                    st.session_state["projekt_daten"] = p_data
+                    st.switch_page("pages/2_🏗️_Planung.py")
+                
+                # Button: Export (Download vom Browser)
+                export_json = json.dumps(p_data, indent=4)
+                c3.download_button(
+                    label="📥 EXPORT",
+                    data=export_json,
+                    file_name=f"Projekt_{p}.json",
+                    mime="application/json",
+                    key=f"exp_{p}",
+                    use_container_width=True
+                )
+                
+                # Button: Löschen
+                if c4.button("🗑️ LÖSCHEN", key=f"del_{p}", use_container_width=True):
+                    # Sicherheitsabfrage via Session State
+                    st.session_state[f"confirm_delete_{p}"] = True
+                
+                if st.session_state.get(f"confirm_delete_{p}"):
+                    st.warning(f"Soll '{p}' wirklich gelöscht werden?")
+                    col_yes, col_no = st.columns(2)
+                    if col_yes.button("JA, Unwiderruflich löschen", key=f"yes_{p}"):
+                        shutil.rmtree(os.path.join(PROJECTS_ROOT, p))
+                        del st.session_state[f"confirm_delete_{p}"]
+                        st.rerun()
+                    if col_no.button("Abbrechen", key=f"no_{p}"):
+                        del st.session_state[f"confirm_delete_{p}"]
                         st.rerun()
 
-    with t2:
-        with st.form("new_proj"):
-            name = st.text_input("Projekt-Bezeichnung / ID")
-            p_type = st.selectbox("Projekt-Kategorie", ["Einfamilienhaus", "Gewerbe / Industrie", "Landwirtschaft", "Solarpark"])
-            customer = st.text_input("Kundenname / Kontakt")
-            if st.form_submit_button("Projekt initialisieren"):
-                slug = name.lower().replace(" ", "_")
-                new_data = {
-                    "metadata": {"name": name, "type": p_type, "customer": customer, "status": "Planung", "date": str(datetime.now())},
-                    "pv": {"fields": [], "ac_power": 0.0, "full_feed": False},
-                    "storage": {"capacity": 0.0, "arbitrage": False, "spread": 0.15},
-                    "mobility": {"fleets": []},
-                    "economics": {"invest": 0.0, "price_buy": 0.35, "price_sell": 0.082}
-                }
-                os.makedirs(os.path.join(PROJECTS_DIR, slug), exist_ok=True)
-                with open(os.path.join(PROJECTS_DIR, slug, "state.json"), "w") as f:
-                    json.dump(new_data, f)
-                st.session_state["active_slug"] = slug
-                st.session_state["projekt_daten"] = new_data
-                st.success("Erfolgreich angelegt!")
+# Projekt Neuanlage Bereich
+st.divider()
+with st.expander("➕ NEUES PROJEKT MANUELL ANLEGEN"):
+    with st.form("new_p"):
+        new_id = st.text_input("Projektbezeichnung")
+        k_name = st.text_input("Kundenname")
+        if st.form_submit_button("Anlegen"):
+            slug = new_id.lower().replace(" ", "_")
+            p_path = os.path.join(PROJECTS_ROOT, slug)
+            os.makedirs(p_path, exist_ok=True)
+            new_data = {
+                "metadata": {"projekt_id": new_id, "erstellt_am": datetime.now().strftime("%d.%m.%Y")},
+                "kunde": {"name": k_name},
+                "pv": {"felder": []}, "speicher": {"kapazität": 0.0}, "mobilität": {"fahrzeuge": []}
+            }
+            with open(os.path.join(p_path, "state.json"), "w", encoding="utf-8") as f:
+                json.dump(new_data, f, indent=4)
+            st.rerun()
