@@ -8,86 +8,93 @@ st.set_page_config(page_title="Lastgang Analyse", page_icon="📊", layout="wide
 
 st.title("📊 Lastgang Analyse")
 
-# 2. Pfad zu den Musterprofilen (Unterordner)
-# WICHTIG: Auf GitHub muss die Struktur so sein: assets/profiles/deine_datei.csv
+# 2. Pfad zu den Musterprofilen
 assets_path = os.path.join("assets", "profiles")
 
-# 3. Die Auswahlmöglichkeit (Toggle) in der Sidebar
-st.sidebar.header("Datenquelle")
+# 3. Sidebar: Auswahl & Upload
+st.sidebar.header("Daten-Einstellungen")
 source_option = st.sidebar.radio(
-    "Wie möchten Sie die Daten bereitstellen?",
-    ["Eigenes Profil hochladen", "Standard Profile (Muster)"]
+    "Datenquelle wählen:",
+    ["Standard-Musterprofil", "Eigenes Profil hochladen"]
 )
 
 df = None
+selected_file_name = ""
 
-# --- FALL A: MANUELLER UPLOAD ---
-if source_option == "Eigenes Profil hochladen":
-    st.subheader("Eigene Datei hochladen")
-    uploaded_file = st.file_uploader("Wählen Sie eine CSV- oder Excel-Datei aus", type=["csv", "xlsx"])
-    
-    if uploaded_file:
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file, sep=None, engine='python')
-            else:
-                df = pd.read_excel(uploaded_file)
-            st.success("Eigene Datei erfolgreich geladen!")
-        except Exception as e:
-            st.error(f"Fehler beim Lesen der Datei: {e}")
+# --- LOGIK: LADEN DER DATEN ---
 
-# --- FALL B: STANDARD PROFILE AUS ASSETS/PROFILES ---
-else:
-    st.subheader("Standard Profile auswählen")
+# FALL A: Musterprofile (Standard-Start)
+if source_option == "Standard-Musterprofil":
     if os.path.exists(assets_path):
-        # Scannt den Unterordner nach Dateien
         muster_files = [f for f in os.listdir(assets_path) if f.endswith(('.csv', '.xlsx', '.xls'))]
-        
         if muster_files:
-            selected_muster = st.selectbox("Wählen Sie ein Musterprofil aus:", muster_files)
+            # Dropdown für Muster, aber das erste ist standardmäßig ausgewählt
+            selected_muster = st.sidebar.selectbox("Muster auswählen:", muster_files, index=0)
             full_path = os.path.join(assets_path, selected_muster)
+            selected_file_name = selected_muster
+            
             try:
                 if selected_muster.endswith('.csv'):
                     df = pd.read_csv(full_path, sep=None, engine='python')
                 else:
                     df = pd.read_excel(full_path)
-                st.info(f"Standard-Profil '{selected_muster}' ist aktiv.")
             except Exception as e:
-                st.error(f"Fehler beim Laden des Standard-Profils: {e}")
+                st.error(f"Fehler beim Laden des Musters: {e}")
         else:
-            st.warning(f"Keine Dateien im Ordner '{assets_path}' gefunden.")
+            st.sidebar.warning("Keine Musterdateien in 'assets/profiles' gefunden.")
     else:
-        st.error(f"Verzeichnis nicht gefunden: {assets_path}")
-        st.info("Hinweis: Stellen Sie sicher, dass der Ordner 'assets' einen Unterordner 'profiles' hat.")
+        st.sidebar.error("Ordner 'assets/profiles' nicht gefunden.")
 
-# --- DATENANZEIGE & ANALYSE (erscheint nur, wenn df geladen wurde) ---
-if df is not None:
-    st.divider() # Optische Trennlinie
-    
-    with st.expander("Vorschau der geladenen Daten"):
-        st.dataframe(df.head(10), use_container_width=True)
-
-    # Spaltenauswahl für die Grafik
-    cols = df.columns.tolist()
-    c1, c2 = st.columns(2)
-    with c1:
-        x_col = st.selectbox("Spalte für Zeitachse (X)", cols, index=0)
-    with c2:
-        y_col = st.selectbox("Spalte für Leistung in kW (Y)", cols, index=1 if len(cols) > 1 else 0)
-
-    # Visualisierung
-    try:
-        fig = px.line(df, x=x_col, y=y_col, title=f"Lastgang Verlauf: {y_col}")
-        fig.update_layout(hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Statistische Auswertung
-        kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("Spitzenlast", f"{df[y_col].max():.2f} kW")
-        kpi2.metric("Ø-Leistung", f"{df[y_col].mean():.2f} kW")
-        kpi3.metric("Anzahl Messpunkte", len(df))
-    except Exception as e:
-        st.error(f"Fehler bei der Grafik-Erstellung: {e}")
+# FALL B: Manueller Upload
 else:
-    # Hilfe-Hinweis, wenn noch nichts gewählt wurde
-    st.lightbulb("Nutzen Sie das Menü auf der linken Seite, um Daten zu laden.")
+    uploaded_file = st.sidebar.file_uploader("Eigene Datei wählen", type=["csv", "xlsx"])
+    if uploaded_file:
+        selected_file_name = uploaded_file.name
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file, sep=None, engine='python')
+            else:
+                df = pd.read_excel(uploaded_file)
+            st.sidebar.success("Datei geladen!")
+        except Exception as e:
+            st.sidebar.error(f"Fehler beim Upload: {e}")
+    else:
+        st.info("Bitte laden Sie eine Datei in der Sidebar hoch.")
+
+# --- ANZEIGE & ANALYSE ---
+
+if df is not None:
+    st.subheader(f"Aktives Profil: {selected_file_name}")
+    
+    # Automatische Spaltenerkennung
+    cols = df.columns.tolist()
+    
+    col1, col2 = st.columns([2, 1])
+    with col2:
+        st.write("### Einstellungen")
+        x_col = st.selectbox("Zeitachse (X)", cols, index=0)
+        y_col = st.selectbox("Leistung in kW (Y)", cols, index=1 if len(cols) > 1 else 0)
+        
+        # Kleine Statistik-Box
+        st.metric("Spitzenlast", f"{df[y_col].max():.2f} kW")
+        st.metric("Durchschnitt", f"{df[y_col].mean():.2f} kW")
+
+    with col1:
+        # Visualisierung
+        try:
+            fig = px.line(df, x=x_col, y=y_col, title="Lastgang Verlauf")
+            fig.update_layout(
+                hovermode="x unified",
+                template="plotly_white",
+                margin=dict(l=0, r=0, t=40, b=0)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Grafik-Fehler: {e}")
+
+    with st.expander("Tabellenansicht (Rohdaten)"):
+        st.dataframe(df.head(100), use_container_width=True)
+
+else:
+    if source_option == "Standard-Musterprofil":
+        st.warning("Es konnte kein Musterprofil geladen werden. Prüfen Sie Ihren 'assets/profiles' Ordner auf GitHub.")
