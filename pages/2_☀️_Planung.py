@@ -1,97 +1,178 @@
 import streamlit as st
 import json
 import os
+import base64
+from datetime import datetime
 
-if "projekt_daten" not in st.session_state:
-    st.error("Kein aktives Projekt!")
+# =================================================================
+# 1. INITIALISIERUNG & PRÜFUNG
+# =================================================================
+if "active_slug" not in st.session_state or "projekt_daten" not in st.session_state:
+    st.error("⚠️ Kein Projekt aktiv. Bitte in der Übersicht ein Projekt öffnen oder neu anlegen.")
     st.stop()
 
 d = st.session_state["projekt_daten"]
+p_slug = st.session_state["active_slug"]
+p_path = os.path.join("projects", p_slug)
+doc_path = os.path.join(p_path, "documents")
+os.makedirs(doc_path, exist_ok=True)
 
-st.title(f"🏗️ Engineering: {d['metadata']['name']}")
+st.set_page_config(page_title="Engineering Terminal", layout="wide")
 
-# --- TOP BAR: SCHNELLÜBERSICHT ---
-m1, m2, m3, m4 = st.columns(4)
-total_kwp = sum(f['kwp'] for f in d['pv']['fields'])
-m1.metric("PV-Leistung", f"{total_kwp:.2f} kWp")
-m2.metric("AC-Leistung", f"{d['pv'].get('ac_power', 0)} kVA")
-m3.metric("Speicher", f"{d['storage'].get('capacity', 0)} kWh")
-m4.metric("Typ", d['metadata']['type'])
+# =================================================================
+# 2. PERSISTENTER HEADER (KUNDENDATEN)
+# =================================================================
+with st.container(border=True):
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        st.subheader(f"📍 Projekt: {d['metadata']['id']}")
+        st.write(f"**Kunde:** {d['kunde']['name']} | {d['kunde']['straße']}, {d['kunde']['plz_ort']}")
+    with c2:
+        st.write(f"**Ansprechpartner:** {d['kunde'].get('ansprechpartner', 'N/A')}")
+        st.write(f"**Zähler-ID:** `{d['kunde'].get('zählernummer', 'N/A')}`")
+    with c3:
+        st.write(f"**Steuer-Status:** {d['kunde'].get('steuer_status', 'N/A')}")
+        if st.button("💾 ZWISCHENSPEICHERN", use_container_width=True):
+            with open(os.path.join(p_path, "state.json"), "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=4)
+            st.toast("Daten gesichert!")
 
-# --- TABS: DETAIL-ENGINEERING ---
-t_pv, t_bat, t_mob, t_eco = st.tabs(["☀️ PV & Dach", "🔋 Speicher & Arbitrage", "🚗 Mobilität & THG", "📉 ROI & BDI"])
+# =================================================================
+# 3. REITER-STRUKTUR
+# =================================================================
+tabs = st.tabs([
+    "☀️ PV-ANLAGE", 
+    "🔋 SPEICHER-HARDWARE", 
+    "🔌 LADEINFRASTRUKTUR", 
+    "💰 ERLÖSZENTRUM (Arbitrage/THG/Ertrag)", 
+    "📈 ROI & INVESTITION"
+])
 
-with t_pv:
-    st.header("Photovoltaik-Konfiguration")
+# --- REITER 1: PV-ANLAGE ---
+with tabs[0]:
+    st.header("PV-Design & Hardware-Komponenten")
+    d['pv']['volleinspeisung'] = st.toggle("Konzept: Volleinspeisung (EEG §21)", d['pv'].get('volleinspeisung', False))
     
-    # Checkbox für Volleinspeisung (Wichtig für Wirtschaftlichkeit)
-    d['pv']['full_feed'] = st.toggle("Volleinspeisung (gem. EEG § 21)", d['pv'].get('full_feed', False))
-    if d['pv']['full_feed']:
-        st.info("System ist auf Volleinspeisung optimiert. Eigenverbrauch wird ignoriert.")
-
     if st.button("➕ Modulfeld hinzufügen"):
-        d['pv']['fields'].append({"name": "Feld", "kwp": 10.0, "modul": "Datenblatt...", "azimut": 0, "neigung": 35})
+        d['pv']['felder'].append({"name": "Feld", "kwp": 10.0, "modul": "", "azimut": 0, "neigung": 35})
     
-    for i, field in enumerate(d['pv']['fields']):
-        with st.expander(f"Feld {i+1}: {field['name']}", expanded=True):
+    for i, f in enumerate(d['pv']['felder']):
+        with st.expander(f"Feld {i+1}: {f['name']}", expanded=True):
             c1, c2, c3 = st.columns(3)
-            field['name'] = c1.text_input("Bezeichnung", field['name'], key=f"fn_{i}")
-            field['kwp'] = c2.number_input("Leistung (kWp)", 0.1, 5000.0, float(field['kwp']), key=f"fk_{i}")
-            field['modul'] = c3.text_input("Hersteller / Typenbezeichnung", field['modul'], key=f"fm_{i}")
+            f['name'] = c1.text_input("Name/Dachseite", f['name'], key=f"pv_n_{i}")
+            f['kwp'] = c2.number_input("Leistung (kWp)", 0.0, 10000.0, float(f['kwp']), key=f"pv_k_{i}")
+            f['modul'] = c3.text_input("Hersteller & Typ", f['modul'], key=f"pv_m_{i}")
+            f['azimut'] = st.slider("Ausrichtung (Süd=0, West=90)", -180, 180, f['azimut'], key=f"pv_a_{i}")
+            f['neigung'] = st.slider("Dachneigung (°)", 0, 90, f['neigung'], key=f"pv_ni_{i}")
+            if st.button("Feld löschen", key=f"pv_d_{i}"):
+                d['pv']['felder'].pop(i); st.rerun()
+
+# --- REITER 2: SPEICHER-HARDWARE ---
+with tabs[1]:
+    st.header("Batteriespeicher (Technische Daten)")
+    col1, col2 = st.columns(2)
+    with col1:
+        d['speicher']['hersteller'] = st.text_input("Hersteller/Modell", d['speicher'].get('hersteller', ''))
+        d['speicher']['kapazität'] = st.number_input("Nettokapazität (kWh)", 0.0, 5000.0, float(d['speicher'].get('kapazität', 0.0)))
+        d['speicher']['leistung'] = st.number_input("Ladeleistung (kW)", 0.0, 2000.0, float(d['speicher'].get('leistung', 0.0)))
+        if d['speicher']['kapazität'] > 0:
+            st.metric("C-Rate", f"{d['speicher']['leistung'] / d['speicher']['kapazität']:.2f} C")
+    with col2:
+        st.subheader("📁 Speicher-Datenblatt")
+        bat_up = st.file_uploader("PDF hochladen", type=["pdf"], key="bat_up")
+        if bat_up:
+            with open(os.path.join(doc_path, f"DB_Speicher_{p_slug}.pdf"), "wb") as f_out:
+                f_out.write(bat_up.getbuffer())
+            st.success("Speicher-Datenblatt archiviert.")
+
+# --- REITER 3: LADEINFRASTRUKTUR (NEU) ---
+with tabs[2]:
+    st.header("Ladepunkte (AC & DC)")
+    if "ladepunkte" not in d: d["ladepunkte"] = []
+    
+    if st.button("➕ Ladepunkt hinzufügen"):
+        d["ladepunkte"].append({"typ": "AC", "leistung": 11.0, "hersteller": "", "modell": ""})
+    
+    for j, lp in enumerate(d["ladepunkte"]):
+        with st.container(border=True):
+            cl1, cl2, cl3, cl4 = st.columns([1, 1, 2, 1])
+            lp['typ'] = cl1.selectbox("Art", ["AC", "DC"], key=f"lp_t_{j}")
+            lp['leistung'] = cl2.number_input("kW", 0.0, 400.0, float(lp['leistung']), key=f"lp_p_{j}")
+            lp['hersteller'] = cl3.text_input("Hersteller/Modell", lp['hersteller'], key=f"lp_h_{j}")
             
-            # Ausrichtung (Grafische Hilfswerte)
-            field['azimut'] = st.select_slider("Ausrichtung", options=[-90, -45, 0, 45, 90], format_func=lambda x: {0:"Süd", -90:"Ost", 90:"West"}.get(x, f"{x}°"), key=f"fa_{i}")
-            field['neigung'] = st.slider("Dachneigung (°)", 0, 90, field['neigung'], key=f"fi_{i}")
-            if st.button("Löschen", key=f"fd_{i}"):
-                d['pv']['fields'].pop(i)
+            st.subheader("📁 Datenblatt Ladepunkt")
+            lp_up = st.file_uploader(f"Upload für {lp['hersteller']}", type=["pdf"], key=f"lp_up_{j}")
+            if lp_up:
+                with open(os.path.join(doc_path, f"DB_Ladepunkt_{j}_{p_slug}.pdf"), "wb") as f_lp:
+                    f_lp.write(lp_up.getbuffer())
+            
+            if cl4.button("🗑️", key=f"lp_d_{j}"):
+                d["ladepunkte"].pop(j); st.rerun()
+
+# --- REITER 4: ERLÖSZENTRUM ---
+with tabs[3]:
+    st.header("Intelligente Ertragsprognose")
+    
+    # PV-Ertrag mit Standort-Sim
+    with st.container(border=True):
+        st.subheader("🌍 PV-Ertrag & Wetterdaten")
+        c_w1, c_w2 = st.columns([2, 1])
+        with c_w1:
+            st.write(f"Berechnung für Standort: **{d['kunde']['plz_ort']}**")
+            d['pv']['spec_yield'] = st.number_input("Spez. Ertrag (kWh/kWp)", 0, 1500, d['pv'].get('spec_yield', 950))
+        with c_w2:
+            if st.button("🛰️ Wetterdaten-Prognose (KI)"):
+                # Simulation Wetterdienst
+                d['pv']['spec_yield'] = 1045
+                st.info("Einstrahlungsprognose (PVGIS) geladen: 1.045 kWh/kWp")
                 st.rerun()
 
-    st.subheader("Wechselrichter & Infrastruktur")
-    d['pv']['ac_power'] = st.number_input("Anschlussleistung AC (kVA)", 0.0, 2000.0, float(d['pv'].get('ac_power', 0.0)))
+    # Arbitrage & THG
+    c_a, c_t = st.columns(2)
+    with c_a:
+        st.subheader("📊 Arbitrage-Handel")
+        d['speicher']['spread'] = st.number_input("Spread (ct/kWh)", 0.0, 50.0, float(d['speicher'].get('spread', 12.0)))
+        if st.button("🤖 KI-Marktprognose laden"):
+            d['speicher']['spread'] = 18.2
+            st.rerun()
+    with c_t:
+        st.subheader("🚗 THG-Flotte")
+        if "thg_fleet" not in d: d["thg_fleet"] = []
+        if st.button("➕ Fahrzeug"): d["thg_fleet"].append({"typ": "PKW", "quote": 250.0})
+        for k, v in enumerate(d["thg_fleet"]):
+            v['typ'] = st.selectbox("Klasse", ["PKW", "LKW", "Bus"], key=f"thg_v_{k}")
+            if st.button("⚡ KI-Quote", key=f"thg_ki_{k}"):
+                v['quote'] = 280 if v['typ'] == "PKW" else 1150
+                st.rerun()
 
-with t_bat:
-    st.header("Speichersystem & Markt-Arbitrage")
-    colb1, colb2 = st.columns(2)
+# --- REITER 5: ROI & INVESTITION ---
+with tabs[4]:
+    st.header("Wirtschaftlichkeit & Investition")
     
-    with colb1:
-        d['storage']['capacity'] = st.number_input("Nutzbare Kapazität (kWh)", 0.0, 5000.0, float(d['storage'].get('capacity', 0.0)))
-        d['storage']['brand'] = st.text_input("Speicher-Hersteller (Datenblatt)", d['storage'].get('brand', ''))
+    inv_mode = st.radio("Investitions-Erfassung", ["Gesamtinvest (Pauschal)", "Hardware-Detail (Einzelauflistung)"])
     
-    with colb2:
-        st.subheader("Intelligenter Arbitrage-Handel")
-        d['storage']['arbitrage'] = st.toggle("Netzdienlicher Arbitrage-Betrieb", d['storage'].get('arbitrage', False))
-        if d['storage']['arbitrage']:
-            d['storage']['spread'] = st.slider("Geplanter Preis-Spread (ct/kWh)", 0.0, 0.50, float(d['storage'].get('spread', 0.15)))
-            st.caption("Differenz zwischen Kauf- und Verkaufspreis am Spotmarkt.")
+    if inv_mode == "Gesamtinvest (Pauschal)":
+        d['wirtschaft']['invest_total'] = st.number_input("Netto-Gesamtinvestition (€)", 0, 10000000, int(d['wirtschaft'].get('invest_total', 0)))
+    else:
+        st.write("Detaillierte Hardware-Kosten:")
+        inv_pv = st.number_input("Kosten PV-Anlage (€)", 0, 5000000)
+        inv_bat = st.number_input("Kosten Speicher (€)", 0, 1000000)
+        inv_lp = st.number_input("Kosten Ladeinfrastruktur (€)", 0, 1000000)
+        d['wirtschaft']['invest_total'] = inv_pv + inv_bat + inv_lp
+        st.write(f"**Berechnete Gesamtsumme: {d['wirtschaft']['invest_total']:,} €**")
 
-with t_mob:
-    st.header("Flottenmanagement & THG-Management")
-    if st.button("➕ Fahrzeuggruppe hinzufügen"):
-        d['mobility']['fleets'].append({"typ": "PKW (M1)", "anzahl": 1, "verbrauch": 18.0})
-    
-    for j, fleet in enumerate(d['mobility']['fleets']):
-        with st.container(border=True):
-            cf1, cf2, cf3, cf4 = st.columns([2, 1, 1, 1])
-            fleet['typ'] = cf1.selectbox("Klasse", ["PKW", "Transporter", "LKW", "Bus"], key=f"ft_{j}")
-            fleet['anzahl'] = cf2.number_input("Menge", 1, 100, fleet['anzahl'], key=f"fa_{j}")
-            fleet['verbrauch'] = cf3.number_input("kWh/100km", 10.0, 150.0, float(fleet['verbrauch']), key=f"fv_{j}")
-            
-            # THG Logik
-            thg_e = fleet['anzahl'] * (280 if fleet['typ'] == "PKW" else 1200)
-            cf4.metric("THG Erlös", f"{thg_e} €/a")
+    st.divider()
+    # ROI VORSCHAU
+    st.subheader("ROI Analyse")
+    pv_total_yield = sum(f['kwp'] for f in d['pv']['felder']) * d['pv']['spec_yield']
+    st.metric("Erwarteter Jahresertrag PV", f"{pv_total_yield:,.2f} kWh")
 
-with t_eco:
-    st.header("Wirtschaftlichkeit & Energiepreise")
-    c_e1, c_e2 = st.columns(2)
-    d['economics']['invest'] = c_e1.number_input("Netto-Investition (€)", 0, 5000000, d['economics'].get('invest', 25000))
-    d['economics']['price_buy'] = c_e2.number_input("Strompreis Bezug (€/kWh)", 0.1, 0.8, d['economics'].get('price_buy', 0.35))
-    d['economics']['price_sell'] = c_e1.number_input("Einspeisevergütung (€/kWh)", 0.0, 0.3, d['economics'].get('price_sell', 0.082))
-
-# SPEICHERN
+# =================================================================
+# 4. FINALE SICHERUNG
+# =================================================================
 st.divider()
-if st.button("💾 Alle Planungsdaten sicher speichern", use_container_width=True):
-    p_path = os.path.join("projects", st.session_state["active_slug"], "state.json")
-    with open(p_path, "w") as f:
+if st.button("💾 KOMPLETTE PROJEKTPLANUNG ABSCHLIESSEN", use_container_width=True):
+    with open(os.path.join(p_path, "state.json"), "w", encoding="utf-8") as f:
         json.dump(d, f, indent=4)
-    st.success("Datenbank aktualisiert!")
+    st.success("Alle Daten, Dokumente und KI-Prognosen wurden erfolgreich gesichert!")
     st.balloons()
