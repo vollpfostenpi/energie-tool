@@ -24,63 +24,81 @@ st.markdown("""
         padding: 15px;
         border-radius: 8px;
     }
+    .stAlert { padding: 10px; border-radius: 5px; }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("☀️ Smart Energy Architect & ROI-Simulator")
+st.title("☀️ Smart Energy Architect & Netz-Check")
 
 # --- SIDEBAR: GLOBALE PARAMETER ---
 with st.sidebar:
+    st.header("🔌 Netz & Infrastruktur")
+    grid_limit_kva = st.number_input("Vorh. Netzanschlussleistung (kVA)", 10, 5000, 40)
+    
+    st.divider()
     st.header("🎯 Modul-Auswahl")
     show_pv = st.checkbox("Photovoltaik (PV)", value=True)
-    show_storage = st.checkbox("Speichersysteme (BESS)", value=True)
+    show_storage = st.checkbox("Speichersysteme (BESS)", value=False)
     show_mobility = st.checkbox("Ladeinfrastruktur & Fuhrpark", value=False)
     show_arbitrage = st.checkbox("Arbitrage & Peak-Shaving", value=False)
     
+    # Logik: Nur PV Modus erkennen
+    only_pv_mode = show_pv and not (show_storage or show_mobility or show_arbitrage)
+    
+    st.divider()
+    st.header("💰 Vergütung & Preise")
+    strompreis_netz = st.slider("Arbeitspreis Bezug (ct/kWh)", 15, 60, 32)
+    
+    # Differenzierte Vergütungssätze
+    with st.expander("Einspeisevergütungen (EEG)", expanded=True):
+        verg_ueberschuss = st.number_input("Vergütung Überschuss (ct/kWh)", 0.0, 15.0, 8.2, help="Satz für Eigenverbrauchsanlagen")
+        verg_voll = st.number_input("Vergütung Volleinspeisung (ct/kWh)", 0.0, 20.0, 13.0, help="Höherer Satz für Volleinspeiser")
+        marktwert_solar = st.number_input("Marktwert Solar (ct/kWh)", 0.0, 50.0, 6.0, help="Für Direktvermarktung (>100 kWp)")
+        dv_kosten = st.number_input("Kosten Direktvermarkter (ct/kWh)", 0.0, 2.0, 0.2, help="Gebühr pro kWh")
+
     st.divider()
     st.header("💰 Investitions-Modus")
     manual_invest = st.toggle("Investition manuell eingeben", value=False)
-    
     if not manual_invest:
-        invest_pv_kwp = st.number_input("Investition PV (€/kWp)", 800, 2500, 1100)
+        invest_pv_kwp = st.number_input("Investition PV (€/kWp)", 600, 2500, 1100)
         invest_bat_kwh = st.number_input("Investition Speicher (€/kWh)", 200, 1500, 550)
     else:
         total_invest_manual = st.number_input("Gesamt-Projektkosten (€)", 0, 5000000, 50000)
-
-    st.divider()
-    strompreis_netz = st.slider("Arbeitspreis Netz (ct/kWh)", 15, 60, 32)
+    
     leistungspreis = 0
     if show_arbitrage:
-        leistungspreis = st.number_input("Leistungspreis (€/kW/Jahr) für RLM", 0, 200, 120, help="Relevant für Peak-Shaving Erlöse")
-    einspeise_verg = st.slider("Einspeisevergütung (ct/kWh)", 0, 15, 7)
+        leistungspreis = st.number_input("Leistungspreis (€/kW/Jahr) RLM", 0, 200, 120)
 
 # --- SESSION STATE ---
 if 'daecher' not in st.session_state: st.session_state.daecher = []
 if 'lade_punkte' not in st.session_state: st.session_state.lade_punkte = []
 if 'fuhrpark' not in st.session_state: st.session_state.fuhrpark = []
 
-# Tabs
-tabs_labels = ["📊 Wirtschaftlichkeit & ROI"]
+tabs_labels = ["📊 Wirtschaftlichkeit & Netz"]
 if show_pv: tabs_labels.append("🏗️ PV-Planung")
-if show_storage: tabs_labels.append("🔋 Speicher (BESS)")
-if show_mobility: tabs_labels.append("🚗 Fuhrpark & Laden")
-if show_arbitrage: tabs_labels.append("📈 Arbitrage & Markt")
+if show_storage: tabs_labels.append("🔋 Speicher")
+if show_mobility: tabs_labels.append("🚗 Fuhrpark")
+if show_arbitrage: tabs_labels.append("📈 Arbitrage")
 
 tabs = st.tabs(tabs_labels)
 
-# Globale Variablen initialisieren
 total_kwp = 0.0
 total_storage_kwh = 0.0
-storage_power_kw = 0.0 # Entladeleistung
-storage_cycles = 6000 # Standardwert
-arbitrage_revenue = 0.0
-peak_shaving_revenue = 0.0
-total_ev_demand_year = 0.0
+pv_operation_mode = "Eigenverbrauch (Überschuss)" # Default
 
 # --- TAB: PV-PLANUNG ---
 if show_pv:
     with tabs[tabs_labels.index("🏗️ PV-Planung")]:
         st.header("🏗️ PV-Projektierung")
+        
+        # 1. ABFRAGE BETRIEBSMODUS (Nur wenn nur PV aktiv ist)
+        if only_pv_mode:
+            st.info("💡 Da Sie nur PV ohne weitere Verbraucher/Speicher planen, wählen Sie das Betriebskonzept:")
+            pv_operation_mode = st.radio("Betriebskonzept wählen:", 
+                                         ["Eigenverbrauch (Überschuss)", "Volleinspeisung"], 
+                                         horizontal=True)
+        
+        # Dach Planung
         if st.button("➕ Neues Dach hinzufügen"):
             st.session_state.daecher.append({'typ': 'Satteldach', 'azimut': 0, 'neigung': 35, 'kwp': 10.0})
         
@@ -94,192 +112,139 @@ if show_pv:
                 if c4.button("🗑️", key=f"del_d_{i}"):
                     st.session_state.daecher.pop(i); st.rerun()
         
-        # Hardware Upload
-        with st.expander("📄 Hardware & Datenblätter (PV)"):
-            h1, h2 = st.columns(2)
-            h1.file_uploader("Datenblatt Module", key="pdf_mod")
-            h2.file_uploader("Datenblatt Wechselrichter", key="pdf_wr")
-        
         total_kwp = sum(d['kwp'] for d in st.session_state.daecher)
 
-# --- TAB: SPEICHER (ERWEITERT) ---
-if show_storage:
-    with tabs[tabs_labels.index("🔋 Speicher (BESS)")]:
-        st.header("🔋 Batteriespeicher-System (BESS)")
-        
-        col_s1, col_s2 = st.columns(2)
-        with col_s1:
-            total_storage_kwh = st.number_input("Nennkapazität (kWh)", 0.0, 10000.0, 50.0)
-        
-        with col_s2:
-            st.info("Für Gewerbespeicher sind C-Rate und Zyklen entscheidend für die Wirtschaftlichkeit.")
+        # HINWEISE ZUR GRÖSSE & DIREKTVERMARKTUNG
+        if total_kwp > 0:
+            st.divider()
+            st.subheader("⚖️ Rechtliche Einordnung")
+            if total_kwp >= 100:
+                st.error(f"⚠️ **Direktvermarktungspflicht:** Mit {total_kwp:.1f} kWp liegen Sie über 100 kWp. Die feste Einspeisevergütung entfällt. Sie müssen den Strom über einen Direktvermarkter an der Börse verkaufen (Marktwert abzüglich Vermarktungskosten).")
+                pv_operation_mode = "Direktvermarktung (>100 kWp)" # Override
+            elif total_kwp >= 25 and pv_operation_mode == "Eigenverbrauch (Überschuss)":
+                st.warning("ℹ️ **Tipp:** Zwischen 25 kWp und 100 kWp kann eine Aufteilung in 'Überschuss' (für Eigenbedarf) und 'Volleinspeisung' (Restdach) sinnvoll sein, oder eine Volleinspeisung, falls der Eigenverbrauch gering ist.")
+            elif pv_operation_mode == "Volleinspeisung":
+                st.success(f"✅ Sie nutzen die höhere Volleinspeisevergütung ({verg_voll} ct/kWh). Dies erfordert einen separaten Zähler.")
 
-        # --- ERWEITERTE TECHNISCHE DATEN ---
-        with st.expander("⚙️ Erweiterte Technische Parameter (C-Rate, Leistung, Zyklen)", expanded=True):
-            st.caption("Diese Werte beeinflussen die ROI-Berechnung, insbesondere bei Arbitrage und Peak-Shaving.")
-            ec1, ec2, ec3 = st.columns(3)
-            
-            # C-Rate Logik
-            c_rate = ec1.number_input("C-Rate (Lade-/Entladefaktor)", 0.1, 5.0, 1.0, step=0.1, help="1C = Speicher in 1h voll/leer. 0.5C = 2h.")
-            
-            # Automatische Berechnung der Leistung, aber überschreibbar
-            calc_power = total_storage_kwh * c_rate
-            storage_power_kw = ec2.number_input("Max. Entladeleistung (kW)", 0.0, 5000.0, float(calc_power), help="Wichtig für Lastspitzenkappung")
-            
-            storage_cycles = ec3.number_input("Zyklenlebensdauer (bei 80% DoD)", 1000, 20000, 6000)
-            
-            dod = st.slider("Depth of Discharge (DoD) - Nutzbare Kapazität", 50, 100, 90, format="%d%%") / 100
-        
         # Hardware Upload
-        st.file_uploader("Datenblatt Speicher / BMS", key="pdf_bat")
+        st.subheader("📄 Komponenten")
+        with st.expander("Hardware-Details erfassen", expanded=False):
+            col_hw1, col_hw2 = st.columns(2)
+            with col_hw1:
+                st.text_input("Modul Hersteller/Typ", key="mod_typ")
+                st.file_uploader("Datenblatt Module", key="pdf_mod")
+            with col_hw2:
+                st.text_input("Wechselrichter Hersteller/Typ", key="wr_typ")
+                st.file_uploader("Datenblatt WR", key="pdf_wr")
 
-# --- TAB: FUHRPARK ---
+# --- TAB: SPEICHER ---
+if show_storage:
+    with tabs[tabs_labels.index("🔋 Speicher")]:
+        st.header("🔋 Speicher")
+        total_storage_kwh = st.number_input("Kapazität (kWh)", 0.0, 5000.0, 0.0)
+        # Hardware Upload
+        with st.expander("Speicher Hardware"):
+            st.text_input("Speicher Typ", key="bat_typ")
+            st.file_uploader("Datenblatt", key="pdf_bat")
+
+# --- TAB: MOBILITY & ARBITRAGE (Platzhalter für Logik) ---
+total_ev_demand_year = 0
+arbitrage_revenue = 0
+peak_shaving_revenue = 0
+max_load_peak_kw = 0
+
 if show_mobility:
-    with tabs[tabs_labels.index("🚗 Fuhrpark & Laden")]:
-        st.header("🚗 Ladeinfrastruktur")
-        col_m1, col_m2 = st.columns(2)
-        with col_m1: 
-            if st.button("➕ Ladepunkt"): st.session_state.lade_punkte.append({'typ': 'Wallbox', 'p': 11})
-            for i, lp in enumerate(st.session_state.lade_punkte):
-                with st.container(border=True):
-                    l1, l2, l3 = st.columns([2,1,1])
-                    lp['typ'] = l1.selectbox(f"Typ #{i}", ["Wallbox (AC)", "DC Charger", "HPC"], key=f"lpt_{i}")
-                    lp['p'] = l2.number_input(f"kW #{i}", 1, 400, value=int(lp['p']), key=f"lpp_{i}")
-                    if l3.button("🗑️", key=f"lpdel_{i}"): st.session_state.lade_punkte.pop(i); st.rerun()
-        
-        with col_m2:
-            if st.button("➕ Fahrzeug"): st.session_state.fuhrpark.append({'art': 'PKW', 'anz': 1, 'km': 20000, 'cons': 0.18})
-            for i, f in enumerate(st.session_state.fuhrpark):
-                with st.container(border=True):
-                    f['art'] = st.selectbox(f"Art #{i}", ["PKW", "LKW 7.5t", "LKW 40t"], key=f"fa_{i}")
-                    f['anz'] = st.number_input(f"Anz #{i}", 1, 100, value=f['anz'], key=f"fanz_{i}")
-                    f['km'] = st.number_input(f"km/J #{i}", 1000, 200000, value=f['km'], key=f"fkm_{i}")
-                    if st.button("🗑️ Fzg", key=f"fdel_{i}"): st.session_state.fuhrpark.pop(i); st.rerun()
-                    f_cons_map = {"PKW": 0.18, "LKW 7.5t": 0.8, "LKW 40t": 1.4}
-                    total_ev_demand_year += (f['anz'] * f['km'] * f_cons_map[f['art']])
-
-# --- TAB: ARBITRAGE & MARKT ---
+    with tabs[tabs_labels.index("🚗 Fuhrpark")]:
+        st.header("Fuhrpark")
+        if st.button("➕ Fzg"): st.session_state.fuhrpark.append({'art': 'PKW', 'km': 20000})
+        for i, f in enumerate(st.session_state.fuhrpark):
+            f['art'] = st.selectbox(f"Art #{i}", ["PKW", "LKW"], key=f"f_{i}")
+            f['km'] = st.number_input(f"km #{i}", value=f['km'], key=f"k_{i}")
+            total_ev_demand_year += (f['km'] * 0.2) # Simple calc
 if show_arbitrage:
-    with tabs[tabs_labels.index("📈 Arbitrage & Markt")]:
-        st.header("📈 Erlösmodelle: Arbitrage & Peak-Shaving")
-        
-        col_arb1, col_arb2 = st.columns(2)
-        
-        with col_arb1:
-            st.subheader("1. Spotmarkt-Arbitrage")
-            st.markdown("Kauf bei Niedrigpreis, Nutzung/Verkauf bei Hochpreis.")
-            
-            spread = st.slider("Durchschnittl. Preis-Spread (ct/kWh)", 5, 40, 15, help="Preisdifferenz zwischen günstigster und teuerster Stunde am Tag")
-            trading_cycles = st.slider("Handelszyklen pro Jahr", 0, 730, 250, help="Wie oft wird der Speicher rein für Handelszwecke voll ge- und entladen?")
-            
-            # Berechnung Arbitrage
-            usable_kwh = total_storage_kwh * dod
-            # Formel: Kapazität * Spread * Zyklen * Wirkungsgrad (ca 0.9)
-            arbitrage_revenue = (usable_kwh * (spread/100) * trading_cycles * 0.9)
-            
-            st.metric("Prognostizierter Arbitrage-Erlös", f"{arbitrage_revenue:,.2f} €/Jahr", delta="Cashflow positiv")
-
-        with col_arb2:
-            st.subheader("2. Peak-Shaving (Lastspitzen)")
-            st.markdown("Reduzierung der Netzentgelte durch Kappen der Jahreshöchstlast.")
-            
-            if storage_power_kw > 0:
-                shaving_potential_kw = st.slider("Gekappte Lastspitze (kW)", 0.0, float(storage_power_kw), float(storage_power_kw*0.5))
-                peak_shaving_revenue = shaving_potential_kw * leistungspreis
-                st.metric("Ersparnis Netzentgelt", f"{peak_shaving_revenue:,.2f} €/Jahr")
-            else:
-                st.warning("Bitte definieren Sie zuerst die Entladeleistung im Tab 'Speicher'.")
+    with tabs[tabs_labels.index("📈 Arbitrage")]:
+        st.header("Arbitrage")
+        st.info("Erlöse fließen in ROI ein.")
+        arbitrage_revenue = st.number_input("Geschätzter Arbitrage Erlös (€/Jahr)", 0.0, 50000.0, 0.0)
 
 # --- TAB 1: ÜBERSICHT & ROI ---
 with tabs[0]:
-    st.header("📊 Business Case & ROI Analyse")
+    st.header("📊 Business Case & Netz-Check")
     
-    # 1. Investitionskosten ermitteln
+    # NETZ CHECK
+    with st.container(border=True):
+        col_n1, col_n2 = st.columns(2)
+        ratio = (total_kwp / grid_limit_kva) * 100
+        col_n1.metric("Anschlussauslastung (PV)", f"{ratio:.1f} %")
+        if total_kwp > grid_limit_kva:
+            col_n1.error("Netzanschluss überschritten!")
+        else:
+            col_n1.success("Netzanschluss OK")
+    
+    st.divider()
+
+    # ROI BERECHNUNG NACH MODUS
+    pv_yield_kwh = total_kwp * 1000 # Ertrag
+    
+    revenue_strom = 0.0
+    revenue_einspeisung = 0.0
+    
+    st.subheader(f"Wirtschaftlichkeit: {pv_operation_mode}")
+
+    if pv_operation_mode == "Direktvermarktung (>100 kWp)":
+        # Direktvermarktung: Alles wird zum Marktwert verkauft (minus Kosten)
+        # Ggf. Eigenverbrauch zum Opportunitätskostensatz, hier vereinfacht:
+        # Erlös = Erzeugung * (Marktwert - Kosten)
+        erloes_pro_kwh = marktwert_solar - dv_kosten
+        revenue_einspeisung = pv_yield_kwh * (erloes_pro_kwh / 100)
+        st.info(f"Kalkulation basierend auf Marktwert ({marktwert_solar} ct) abzgl. Vermarktungskosten ({dv_kosten} ct).")
+
+    elif pv_operation_mode == "Volleinspeisung":
+        # Volleinspeisung: Alles wird zur hohen Vergütung eingespeist
+        revenue_einspeisung = pv_yield_kwh * (verg_voll / 100)
+        st.info(f"Kalkulation basierend auf Volleinspeisevergütung ({verg_voll} ct).")
+
+    else: 
+        # Eigenverbrauch (Überschuss)
+        # 1. Eigenverbrauch bestimmen
+        base_self_use = 0.3 if total_storage_kwh == 0 else 0.6
+        if total_ev_demand_year > 0: base_self_use += 0.1
+        
+        self_used_kwh = min(pv_yield_kwh * base_self_use, pv_yield_kwh)
+        fed_in_kwh = pv_yield_kwh - self_used_kwh
+        
+        revenue_strom = self_used_kwh * (strompreis_netz / 100) # Eingesparte Stromkosten
+        revenue_einspeisung = fed_in_kwh * (verg_ueberschuss / 100) # EEG Vergütung
+        
+        st.info(f"Kalkulation: {base_self_use*100:.0f}% Eigenverbrauch ({strompreis_netz} ct gespart) + Rest Überschussvergütung ({verg_ueberschuss} ct).")
+
+    # Gesamtergebnis
+    total_annual_revenue = revenue_strom + revenue_einspeisung + arbitrage_revenue + peak_shaving_revenue
+    
     if manual_invest:
         invest_total = total_invest_manual
     else:
-        invest_total = (total_kwp * invest_pv_kwp) + (total_storage_kwh * invest_bat_kwh)
-        # Ladeinfrastruktur pauschal dazu (Dummy)
-        invest_total += len(st.session_state.lade_punkte) * 2000 
+        invest_total = (total_kwp * invest_pv_kwp) + (total_storage_kwh * invest_bat_kwh) + (len(st.session_state.lade_punkte) * 2000)
 
-    # 2. Ersparnisse / Einnahmen ermitteln
-    # PV Ertrag
-    pv_yield_kwh = total_kwp * 1000 # ca 1000 kWh/kWp
-    
-    # Eigenverbrauchsquote schätzen (Simuliert)
-    if total_storage_kwh > 0:
-        self_consumption_rate = 0.70 # Mit Speicher
-        if total_ev_demand_year > 0: self_consumption_rate = 0.85 # Mit E-Auto + Speicher
-    else:
-        self_consumption_rate = 0.30 # Ohne Speicher
-    
-    self_used_kwh = min(pv_yield_kwh * self_consumption_rate, pv_yield_kwh) # Kann nicht mehr als Erzeugung sein
-    # Wenn EV Bedarf höher als PV Erzeugung, wird alles verbraucht (vereinfacht)
-    if total_ev_demand_year > pv_yield_kwh:
-        self_used_kwh = pv_yield_kwh 
-
-    fed_in_kwh = pv_yield_kwh - self_used_kwh
-    
-    # Cashflows
-    savings_stromkosten = self_used_kwh * (strompreis_netz / 100)
-    income_einspeisung = fed_in_kwh * (einspeise_verg / 100)
-    
-    total_annual_revenue = savings_stromkosten + income_einspeisung + arbitrage_revenue + peak_shaving_revenue
-    
-    # ROI
     roi_years = invest_total / total_annual_revenue if total_annual_revenue > 0 else 999
 
-    # --- KPI DISPLAY ---
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Gesamt-Investition (CAPEX)", f"{invest_total:,.0f} €")
-    c2.metric("Jährlicher Cashflow", f"{total_annual_revenue:,.0f} €", help="Stromersparnis + Einspeisung + Arbitrage + Peak-Shaving")
+    # METRIKEN
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Investition", f"{invest_total:,.0f} €")
+    m2.metric("Cashflow / Jahr", f"{total_annual_revenue:,.0f} €")
+    m3.metric("ROI", f"{roi_years:.1f} Jahre", delta_color="inverse")
     
-    roi_color = "normal"
-    if roi_years < 7: roi_color = "inverse"
-    c3.metric("ROI (Amortisation)", f"{roi_years:.1f} Jahre")
-    
-    c4.metric("Speicher C-Rate", f"{storage_power_kw/total_storage_kwh if total_storage_kwh>0 else 0:.1f} C", 
-              help="Zeigt an, wie leistungsfähig der Speicher im Verhältnis zur Kapazität ist.")
+    avg_erloes_kwh = (total_annual_revenue / pv_yield_kwh * 100) if pv_yield_kwh > 0 else 0
+    m4.metric("Ø Erlös pro kWh", f"{avg_erloes_kwh:.2f} ct")
 
-    st.divider()
-
-    # --- ROI CHART ---
-    st.subheader("Entwicklung des kumulierten Cashflows")
-    
+    # Chart
     years = 20
-    x_axis = np.arange(years + 1)
-    # Cashflow Array erstellen
     cf_cum = [-invest_total]
-    for y in range(1, years + 1):
-        # Degression PV Module und Speicherleistung berücksichtigen (vereinfacht -0.5% p.a.)
-        factor = (1 - 0.005) ** y
-        yearly_rev = total_annual_revenue * factor
-        # Wartungskosten abziehen (ca 1% vom Invest)
-        opex = invest_total * 0.01
-        cf_cum.append(cf_cum[-1] + yearly_rev - opex)
+    for y in range(1, years+1):
+        cf_cum.append(cf_cum[-1] + total_annual_revenue - (invest_total*0.01))
     
-    fig_roi = go.Figure()
-    fig_roi.add_trace(go.Scatter(x=x_axis, y=cf_cum, fill='tozeroy', 
-                                mode='lines+markers', name='Kumulierter Gewinn',
-                                line=dict(color='#28a745' if roi_years < 10 else '#ffc107', width=3)))
-    
-    # Break-Even Linie
-    fig_roi.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Break-Even")
-    
-    fig_roi.update_layout(
-        xaxis_title="Jahre nach Inbetriebnahme",
-        yaxis_title="Gewinn / Verlust (€)",
-        hovermode="x unified",
-        height=400
-    )
-    st.plotly_chart(fig_roi, use_container_width=True)
-
-    # --- TECHNISCHE ZUSAMMENFASSUNG ---
-    with st.expander("📝 Detaillierte Zusammensetzung der Einnahmen", expanded=False):
-        st.write(f"- **Stromkosteneinsparung (Eigenverbrauch):** {savings_stromkosten:,.2f} €")
-        st.write(f"- **Einspeisevergütung:** {income_einspeisung:,.2f} €")
-        if show_arbitrage:
-            st.write(f"- **Arbitrage-Handel (Spotmarkt):** {arbitrage_revenue:,.2f} €")
-            st.write(f"- **Peak-Shaving (Netzentgelt):** {peak_shaving_revenue:,.2f} €")
-            if total_storage_kwh > 0 and (storage_power_kw / total_storage_kwh) < 0.5:
-                st.warning("⚠️ Achtung: Die gewählte C-Rate ist niedrig (< 0.5). Arbitrage und Peak-Shaving sind physikalisch eventuell nur eingeschränkt möglich!")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=np.arange(years+1), y=cf_cum, fill='tozeroy', line=dict(color='green')))
+    fig.add_hline(y=0, line_color="red", line_dash="dash")
+    fig.update_layout(title="Amortisationsverlauf", height=350, yaxis_title="€")
+    st.plotly_chart(fig, use_container_width=True)
