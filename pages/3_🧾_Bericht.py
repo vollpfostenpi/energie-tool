@@ -1,66 +1,66 @@
 import streamlit as st
-import io
+import plotly.express as px
 from datetime import datetime
-from core.core import get_official_sources
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
 
-st.set_page_config(page_title="Bericht Export", layout="wide")
-st.title("🧾 Experten-Bericht")
+st.set_page_config(page_title="Experten-Bericht", layout="wide")
 
-st.markdown("""
-Generieren Sie hier eine Zusammenfassung der Ergebnisse für Kunden oder die Geschäftsführung.
-Alle Daten basieren auf den offiziellen Berechnungsgrundlagen.
-""")
+if not st.session_state.get("active_project"):
+    st.error("Kein Projekt geladen.")
+    st.stop()
 
-def create_pdf_report(client_name):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
-    sources = get_official_sources()
+data = st.session_state["projekt_daten"]
+p_name = st.session_state['project_name']
 
-    # Titel
-    story.append(Paragraph(f"Energetische Analyse: {client_name}", styles['Title']))
-    story.append(Paragraph(f"Erstellt am: {datetime.now().strftime('%d.%m.%Y')}", styles['Normal']))
-    story.append(Spacer(1, 20))
+st.title(f"📄 Experten-Bericht")
+st.subheader(f"Analyseergebnisse für {p_name}")
 
-    # Sektion: THG & E-Flotte
-    story.append(Paragraph("1. THG-Quote & E-Mobilität", styles['Heading2']))
-    story.append(Paragraph(
-        "Die Integration von Elektrofahrzeugen ermöglicht die Generierung von Zusatzerlösen "
-        "über die Treibhausgasminderungsquote. Dies ist ein wesentlicher Faktor für die TCO-Berechnung."
-    , styles['Normal']))
-    story.append(Spacer(1, 10))
+# --- KENNZAHLEN ---
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("PV-Leistung", f"{data['total_kwp']} kWp")
+c2.metric("Speicher", f"{data['total_kwh']} kWh")
+c3.metric("Ladepunkte", f"{len(data['lade_punkte'])}")
+c4.metric("Lastgang", "Ja" if data['lastgang_vorhanden'] else "Standard")
+
+# --- ANALYSE-GRAFIKEN ---
+st.divider()
+st.subheader("📊 Ertrag & Eigenverbrauch")
+col_g1, col_g2 = st.columns(2)
+
+with col_g1:
+    # Beispielhafte Ertragsberechnung
+    labels = ['Eigenverbrauch', 'Einspeisung']
+    values = [data['total_kwp']*400, data['total_kwp']*600]
+    fig = px.pie(names=labels, values=values, hole=0.5, title="Energieverwendung")
+    st.plotly_chart(fig, use_container_width=True)
     
-    # Quellen-Tabelle
-    data = [["Thema", "Offizielle Quelle"],
-            ["THG-Quote", "NOW GmbH"],
-            ["CO2-Preis", "Umweltbundesamt / BEHG"],
-            ["Marktdaten", "SMARD.de / BNetzA"]]
-    
-    t = Table(data, colWidths=[100, 300])
-    t.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                           ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                           ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                           ('GRID', (0, 0), (-1, -1), 0.5, colors.black)]))
-    story.append(t)
-    story.append(Spacer(1, 20))
 
-    story.append(Paragraph(f"Referenzlink THG: {sources['THG-Quote']}", styles['Italic']))
+with col_g2:
+    # Wirtschaftlichkeitssimulation
+    jahre = list(range(1, 21))
+    cashflow = [- (data['total_kwp']*1200 + data['total_kwh']*600) + (i * data['total_kwp']*180) for i in jahre]
+    fig2 = px.line(x=jahre, y=cashflow, title="Kumulierter Cashflow über 20 Jahre", labels={'x':'Jahre', 'y':'Euro'})
+    fig2.add_hline(y=0, line_dash="dash", line_color="red")
+    st.plotly_chart(fig2, use_container_width=True)
 
-    doc.build(story)
-    return buffer.getvalue()
+# --- RECHTLICHER CHECK (COMPLIANCE) ---
+st.divider()
+st.subheader("⚖️ Rechtliche & Gesetzliche Prüfung")
 
-client_name = st.text_input("Kundenname / Projektbezeichnung", value="Spedition Beispiel")
+# GEIG Prüfung
+if len(data['lade_punkte']) == 0:
+    st.error("🚨 **GEIG-Alarm:** Laut Gebäude-Elektromobilitätsinfrastruktur-Gesetz (GEIG) müssen Nicht-Wohngebäude ab 20 Stellplätzen Ladepunkte vorweisen. Ihre Planung enthält aktuell keine.")
+else:
+    st.success("✅ **GEIG-Check:** Ladeinfrastruktur ist in der Planung enthalten.")
 
-if st.button("📄 PDF-Bericht generieren"):
-    pdf_bytes = create_pdf_report(client_name)
-    st.download_button(
-        label="📥 Download PDF",
-        data=pdf_bytes,
-        file_name=f"Energiebericht_{client_name.replace(' ', '_')}.pdf",
-        mime="application/pdf"
-    )
+# EnWG Prüfung
+if data['total_kwh'] > 0:
+    st.info("**📌 EnWG §14a:** Da ein Speicher geplant ist, ist die Anlage als steuerbare Verbrauchseinrichtung anzumelden. Dies ermöglicht reduzierte Netzentgelte.")
+
+# EEG Hinweis
+if data['total_kwp'] > 25:
+    st.warning("**⚠️ EEG-Pflicht:** Über 25 kWp ist die Steuerbarkeit durch den Netzbetreiber (iMSys) zwingend.")
+
+# --- FOOTER & EXPORT ---
+st.divider()
+st.button("📥 PDF-Bericht generieren (Vollversion)")
+st.caption("Bericht erstellt am " + datetime.now().strftime("%d.%m.%Y") + " | Energy Expert Pro 2026")
