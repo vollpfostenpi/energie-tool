@@ -1,0 +1,17 @@
+{
+  "status": "open",
+  "created": "20251027_135237",
+  "project_name": "TItze",
+  "customer_name": "Wilhelm Titze",
+  "site_name": "Walchum,",
+  "customer": {
+    "street": "im Birkengrund 32",
+    "zip": "",
+    "city": "",
+    "phone": "+49 5931845246",
+    "email": "xy@gmx.de",
+    "ref": ""
+  },
+  "notes": "",
+  "updated": "20260116_134335"
+}

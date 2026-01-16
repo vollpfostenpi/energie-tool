@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+plotly
+xlsxwriter
+openpyxl
+Pillow
+reportlab
+pytest
+altair==5.4.1

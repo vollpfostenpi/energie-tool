@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+# Arbeitsverzeichnis im Container
+WORKDIR /app
+
+# System-Abhängigkeiten installieren
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dateien kopieren
+COPY . .
+
+# Bibliotheken installieren (hier wird Altair fixiert)
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install "altair<5.5.0"
+
+# Port für Streamlit öffnen
+EXPOSE 8080
+
+# Startbefehl
+ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=8080", "--server.address=0.0.0.0"]
