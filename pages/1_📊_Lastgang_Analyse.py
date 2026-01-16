@@ -1,70 +1,48 @@
 import streamlit as st
 import pandas as pd
+import os
 import plotly.express as px
-from core.core import auto_read, try_parse_datetime, clean_numeric, get_official_sources
 
-st.set_page_config(page_title="Lastgang Analyse", layout="wide")
+# Konfiguration der Seite
+st.set_page_config(page_title="Lastgang Analyse", page_icon="📊", layout="wide")
 
-st.title("📊 Lastgang-Analyse & Energiedaten")
+st.title("📊 Lastgang Analyse")
 st.markdown("""
-Analysieren Sie Ihre Verbrauchsdaten aus synPRO oder RLM-Ausläsen. 
-Diese Daten bilden die Basis für die PV-Dimensionierung und THG-Flottenplanung.
+Analysieren Sie hier Ihren Stromverbrauch. Sie können entweder eigene Daten hochladen 
+oder auf vorbereitete Musterprofile aus unserem System zurückgreifen.
 """)
 
-# Sidebar für Einstellungen
-with st.sidebar:
-    st.header("⚙️ Import-Optionen")
-    up = st.file_uploader("Datei hochladen (.dat, .csv, .xlsx)", type=["dat", "csv", "xlsx"])
-    work_price = st.number_input("Arbeitspreis Netz (ct/kWh)", value=28.5, step=0.5)
+# --- NAVIGATION / DATENAUSWAHL ---
+st.sidebar.header("Datenquelle")
+source_option = st.sidebar.radio(
+    "Quelle wählen:",
+    ["Eigenes Profil (.csv, .xlsx)", "Musterprofile"]
+)
 
-if up:
-    df = auto_read(up)
-    
-    if not df.empty:
-        st.success(f"✅ Datei '{up.name}' erfolgreich geladen.")
-        
-        # Spalten-Mapping
-        cols = df.columns.tolist()
-        col_1, col_2 = st.columns(2)
-        with col_1:
-            time_col = st.selectbox("Zeitstempel-Spalte", cols, index=0)
-        with col_2:
-            val_col = st.selectbox("Leistungs-Spalte (kW/W)", cols, index=len(cols)-1)
-        
-        # Daten-Konvertierung
-        df[time_col] = df[time_col].apply(try_parse_datetime)
-        df = df.dropna(subset=[time_col])
-        df[val_col] = df[val_col].apply(clean_numeric)
-        
-        # Automatische Watt/Kilowatt Erkennung
-        if df[val_col].max() > 5000:
-            df[val_col] = df[val_col] / 1000.0
-            st.info("💡 Werte wurden automatisch von Watt in kW umgerechnet.")
+assets_path = "assets"
+df = None
 
-        df = df.set_index(time_col).sort_index()
-        series = df[val_col]
+if source_option == "Eigenes Profil (.csv, .xlsx)":
+    uploaded_file = st.sidebar.file_uploader("Datei hochladen", type=["csv", "xlsx"])
+    if uploaded_file:
+        try:
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file, sep=None, engine='python')
+            else:
+                df = pd.read_excel(uploaded_file)
+            st.sidebar.success("Datei erfolgreich geladen!")
+        except Exception as e:
+            st.sidebar.error(f"Fehler beim Laden: {e}")
 
-        # Key Metrics
-        m1, m2, m3, m4 = st.columns(4)
-        # Grobe Schätzung des Jahresverbrauchs basierend auf der Durchschnittslast
-        annual_energy = series.mean() * 8760 
-        
-        m1.metric("Spitzenlast", f"{series.max():.2f} kW")
-        m2.metric("Grundlast", f"{series.min():.2f} kW")
-        m3.metric("Jahresverbrauch (ca.)", f"{annual_energy:,.0f} kWh".replace(",", "."))
-        m4.metric("Stromkosten (Netz)", f"{(annual_energy * work_price / 100):,.0f} €".replace(",", "."))
-
-        # Chart
-        st.subheader("📈 Lastprofil im Zeitverlauf")
-        fig = px.line(df, y=val_col, labels={val_col: "Leistung [kW]", time_col: "Zeitstempel"})
-        fig.update_traces(line_color='#0E7C86')
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Speichern für andere Seiten
-        st.session_state['lastgang_data'] = series
-        
-        st.caption(f"Datenbasis zur Verifizierung: [SMARD Marktdaten]({get_official_sources()['Marktdaten']})")
-    else:
-        st.error("Format nicht erkannt. Bitte prüfen Sie die Datei.")
-else:
-    st.info("Bitte laden Sie eine Lastgang-Datei hoch, um mit der Analyse zu beginnen.")
+else: # Musterprofile aus assets/
+    if os.path.exists(assets_path):
+        muster_files = [f for f in os.listdir(assets_path) if f.endswith(('.csv', '.xlsx', '.xls'))]
+        if muster_files:
+            selected_muster = st.sidebar.selectbox("Muster auswählen:", muster_files)
+            full_path = os.path.join(assets_path, selected_muster)
+            try:
+                if selected_muster.endswith('.csv'):
+                    df = pd.read_csv(full_path, sep=None, engine='python')
+                else:
+                    df = pd.read_excel(full_path)
+                st.sidebar.info(f"Musterprofil geladen: {selected
