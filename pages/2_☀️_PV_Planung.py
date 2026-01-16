@@ -7,12 +7,12 @@ import plotly.graph_objects as go
 # --- SEITENKONFIGURATION ---
 st.set_page_config(page_title="Energy Expert PRO 2026", page_icon="☀️", layout="wide")
 
-# Custom Styling für bessere Struktur
+# Custom Styling
 st.markdown("""
     <style>
     .stMetric { background-color: #f8f9fa; padding: 15px; border-radius: 12px; border: 1px solid #dee2e6; }
     .stAlert { border-radius: 12px; }
-    .hardware-section { background-color: #ffffff; padding: 20px; border-radius: 10px; border: 1px dotted #007bff; margin-top: 15px; }
+    .hardware-section { background-color: #ffffff; padding: 20px; border-radius: 10px; border: 1px solid #e2e8f0; margin-top: 15px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -60,14 +60,11 @@ arbitrage_revenue = 0.0
 if show_pv:
     with tabs[tabs_labels.index("🏗️ PV-Planung")]:
         st.header("🏗️ PV-Projektierung")
-        
-        # Logik: Nur PV Prüfung
         only_pv = show_pv and not (show_storage or show_mobility or show_arbitrage)
         pv_mode = "Eigenverbrauch"
         if only_pv:
             pv_mode = st.radio("Betriebsmodus", ["Eigenverbrauch (Überschuss)", "Volleinspeisung"], horizontal=True)
         
-        st.subheader("🏠 Dachflächen")
         if st.button("➕ Dachfläche hinzufügen"):
             st.session_state.daecher.append({'kwp': 15.0})
         for i, d in enumerate(st.session_state.daecher):
@@ -96,52 +93,63 @@ if show_pv:
                     w['anz'] = st.number_input(f"Anzahl", 0, 100, key=f"wa_{i}")
                     st.file_uploader(f"Datenblatt WR #{i+1}", type=["pdf"], key=f"wpdf_{i}")
 
-# --- TAB: SPEICHER ---
+# --- TAB: SPEICHER (ERWEITERT) ---
 if show_storage:
     with tabs[tabs_labels.index("🔋 Speicher")]:
-        st.header("🔋 Batteriespeicher (BESS)")
-        if st.button("➕ Speichersystem hinzufügen"): 
-            st.session_state.bat_systeme.append({'kwh': 10.0, 'zyklen': 6000, 'dod': 90})
+        st.header("🔋 Professionelles Batteriespeichersystem (BESS)")
+        
+        if st.button("➕ Speichersystem / Batteriestrang hinzufügen"): 
+            st.session_state.bat_systeme.append({
+                'typ': '', 'kwh': 10.0, 'zyklen': 6000, 
+                'dod': 90, 'c_rate': 0.5, 'effizienz': 95
+            })
         
         for i, b in enumerate(st.session_state.bat_systeme):
             with st.container(border=True):
-                c1, c2, c3 = st.columns(3)
-                b['typ'] = c1.text_input(f"Modell #{i+1}", key=f"bt_{i}")
-                b['kwh'] = c2.number_input(f"Kapazität (kWh)", 0.0, 5000.0, b['kwh'], key=f"bk_{i}")
-                b['dod'] = c3.slider(f"DoD %", 50, 100, 90, key=f"bd_{i}")
+                st.subheader(f"System #{i+1}")
+                c1, c2, c3 = st.columns([2,1,1])
+                b['typ'] = c1.text_input(f"Hersteller & Modell", b['typ'], key=f"b_t_{i}", placeholder="z.B. BYD Chess / Tesla Powerpack")
+                b['kwh'] = c2.number_input(f"Kapazität (kWh)", 0.1, 10000.0, b['kwh'], key=f"b_k_{i}")
+                b['effizienz'] = c3.number_input(f"Wirkungsgrad (%)", 70, 100, b['effizienz'], key=f"b_e_{i}")
                 
                 c4, c5, c6 = st.columns(3)
-                b['zyklen'] = c4.number_input(f"Zyklenfestigkeit", 1000, 15000, 6000, key=f"bz_{i}")
-                st.file_uploader(f"Datenblatt Speicher #{i+1}", type=["pdf"], key=f"bpdf_{i}")
-                if c6.button(f"🗑️ System {i+1}", key=f"bdel_{i}"): st.session_state.bat_systeme.pop(i); st.rerun()
+                b['c_rate'] = c4.number_input(f"C-Rate (Lade/Entladefaktor)", 0.1, 5.0, b['c_rate'], key=f"b_c_{i}", help="Verhältnis von Leistung zu Kapazität. 0.5C bei 10kWh = 5kW Leistung.")
+                b['dod'] = c5.slider(f"Entladetiefe (DoD %)", 50, 100, b['dod'], key=f"b_d_{i}")
+                b['zyklen'] = c6.number_input(f"Garantierte Zyklen", 1000, 20000, b['zyklen'], key=f"b_z_{i}")
+                
+                # Berechnete Info-Werte
+                leistung_kw = b['kwh'] * b['c_rate']
+                st.info(f"💡 System-Leistung: **{leistung_kw:.1f} kW** | Nutzbare Energie: **{b['kwh'] * (b['dod']/100):.1f} kWh**")
+                
+                # Hardware & Dokumentation
+                c_pdf, c_del = st.columns([3,1])
+                c_pdf.file_uploader(f"Datenblatt Speicher #{i+1} hochladen", type=["pdf"], key=f"b_pdf_{i}")
+                if c_del.button(f"🗑️ System {i+1} entfernen", key=f"b_del_{i}"): 
+                    st.session_state.bat_systeme.pop(i)
+                    st.rerun()
         
         total_storage_kwh = sum(b['kwh'] for b in st.session_state.bat_systeme)
+        st.divider()
+        st.metric("Gesamt-Speicherkapazität installiert", f"{total_storage_kwh:,.1f} kWh")
 
 # --- TAB: MOBILITÄT & LADEN ---
 if show_mobility:
     with tabs[tabs_labels.index("🚗 Mobilität & Laden")]:
         st.header("🚗 Infrastruktur & Dokumentation")
-        
-        st.subheader("🔌 Ladepunkte (AC & DC)")
         if st.button("➕ Ladepunkt"):
             st.session_state.lade_punkte.append({'art': 'AC', 'p': 11.0, 'anz': 1})
-        
         for i, lp in enumerate(st.session_state.lade_punkte):
             with st.container(border=True):
                 l1, l2, l3 = st.columns([2,1,1])
                 lp['art'] = l1.selectbox(f"Art #{i+1}", ["AC (Wallbox)", "DC (Schnelllader)"], key=f"lpt_{i}")
                 lp['p'] = l2.number_input(f"Leistung (kW)", 1.0, 400.0, lp['p'], key=f"lpp_{i}")
                 lp['anz'] = l3.number_input(f"Anzahl", 1, 100, key=f"lpn_{i}")
-                
-                c_pdf, c_del = st.columns([3,1])
-                c_pdf.file_uploader(f"Datenblatt Ladepunkt #{i+1}", type=["pdf"], key=f"lpdf_{i}")
-                if c_del.button(f"🗑️ LP {i+1}", key=f"lpd_{i}"): st.session_state.lade_punkte.pop(i); st.rerun()
-                
+                st.file_uploader(f"Datenblatt Ladepunkt #{i+1}", type=["pdf"], key=f"lpdf_{i}")
+                if st.button(f"🗑️ LP {i+1}", key=f"lpd_{i}"): st.session_state.lade_punkte.pop(i); st.rerun()
                 if "AC" in lp['art']: total_lp_power_ac += (lp['p'] * lp['anz'])
                 else: total_lp_power_dc += (lp['p'] * lp['anz'])
 
         st.divider()
-        st.subheader("🚐 Fuhrpark (THG)")
         if st.button("➕ Fahrzeuggruppe"):
             st.session_state.fuhrpark.append({'art': 'PKW', 'anz': 1})
         for i, f in enumerate(st.session_state.fuhrpark):
@@ -157,51 +165,35 @@ if show_mobility:
 if show_arbitrage:
     with tabs[tabs_labels.index("📈 Arbitrage")]:
         st.header("📈 Spotmarkt-Optimierung & Arbitrage")
-        
         with st.container(border=True):
             arb_mode = st.radio("Arbitrage-Modus", ["Manuelle Parameter", "Referenz-Abgleich (Live-Sim)", "KI-Prognose 2026"])
-            
             c_a1, c_a2, c_a3 = st.columns(3)
             if arb_mode == "Manuelle Parameter":
                 spread = c_a1.number_input("Ø Preis-Spread (ct/kWh)", 0.0, 50.0, 14.5)
                 cycles = c_a2.number_input("Zyklen/Jahr", 0, 1000, 250)
             elif arb_mode == "Referenz-Abgleich (Live-Sim)":
-                st.success("Referenzdaten 2025/26 geladen: Marktdurchschnitt Spread 15.2 ct/kWh")
-                spread = 15.2
-                cycles = 280
+                spread, cycles = 15.2, 280
+                st.success(f"Referenz 2026: {spread} ct Spread.")
             else:
-                st.info("KI-Prognose: Steigende Volatilität durch Windkraft-Zubau erwartet.")
-                spread = 18.5
-                cycles = 310
-            
+                spread, cycles = 18.5, 310
+                st.info("KI-Prognose: Höhere Volatilität.")
             arbitrage_revenue = (total_storage_kwh * 0.9 * (spread/100) * cycles)
-            c_a3.metric("Zusatz-Erlös Arbitrage", f"{arbitrage_revenue:,.2f} €/a")
+            c_a3.metric("Zusatz-Erlös", f"{arbitrage_revenue:,.2f} €/a")
 
 # --- TAB 1: ROI & NETZ-CHECK ---
 with tabs[0]:
     st.header("📊 ROI & Netz-Flaschenhals")
-    
     total_peak = max(total_kwp, (total_lp_power_ac + total_lp_power_dc) * 0.65)
-    
     with st.container(border=True):
         nc1, nc2, nc3 = st.columns(3)
         nc1.metric("Anschlussleistung", f"{grid_limit_kva} kVA")
         nc2.metric("Simulierter Peak", f"{total_peak:.1f} kW")
-        ratio = (total_peak / grid_limit_kva) * 100
-        nc3.metric("Auslastung", f"{ratio:.1f} %")
-        if total_peak > grid_limit_kva: st.error("⚠️ Achtung: Anschlusskapazität überschritten!")
-        else: st.success("✅ Netzanschluss ausreichend.")
-
-    # ROI
-    pv_yield = total_kwp * 1050
-    if only_pv and pv_mode == "Volleinspeisung":
-        benefit = pv_yield * (einspeise_verg_voll/100)
-    else:
-        ev_rate = 0.35 + (0.35 if total_storage_kwh > 0 else 0) + (0.10 if show_mobility else 0)
-        ev_rate = min(ev_rate, 0.95)
-        benefit = (pv_yield * ev_rate * (strompreis_netz/100)) + \
-                  (pv_yield * (1-ev_rate) * (8.2/100)) + thg_revenue + arbitrage_revenue
+        nc3.metric("Auslastung", f"{(total_peak / grid_limit_kva) * 100:.1f} %")
     
+    pv_yield = total_kwp * 1050
+    ev_rate = 0.35 + (0.35 if total_storage_kwh > 0 else 0) + (0.10 if show_mobility else 0)
+    ev_rate = min(ev_rate, 0.95)
+    benefit = (pv_yield * ev_rate * (strompreis_netz/100)) + (pv_yield * (1-ev_rate) * (8.2/100)) + thg_revenue + arbitrage_revenue
     invest = (total_kwp * 1150) + (total_storage_kwh * 500) + (len(st.session_state.lade_punkte) * 2500)
     
     st.divider()
