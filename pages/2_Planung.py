@@ -62,6 +62,13 @@ OBJECTIVES = [
 ]
 HAK_MODE_OPTIONS = ["Ampere", "kW"]
 
+# Plausibilitäts-Grenzen (weich, Warnung statt Blockade)
+PLAUS_ROOF_W_MAX = 300.0       # m
+PLAUS_ROOF_D_MAX = 300.0       # m
+PLAUS_ROOF_AREA_WARN = 10_000.0  # m² (Warnschwelle)
+PLAUS_ROOF_AREA_HARD = 1_000_000.0  # m² (UI max)
+PLAUS_ROOF_MOD_WARN = 200_000  # Module
+
 
 # ================================================================
 # 2) DEFAULTS / MIGRATION
@@ -71,7 +78,6 @@ def _hak_kw_from_ampere(a: float) -> float:
 
 
 def _hak_ampere_from_kw(kw: float) -> int:
-    # Rückrechnung grob
     a = float(kw) * 1000.0 / (400.0 * 1.73)
     return int(max(round(a), 1))
 
@@ -80,9 +86,9 @@ DEFAULTS = {
     "kunde": {"name": "—"},
     "scope": ["PV-System", "Speicher", "Ladeinfrastruktur"],
     "tech": {
-        "hak_mode": "Ampere",   # NEU: Ampere oder kW
+        "hak_mode": "Ampere",
         "hak_ampere": 63,
-        "hak_kw": round(_hak_kw_from_ampere(63), 1),  # NEU
+        "hak_kw": round(_hak_kw_from_ampere(63), 1),
         "ems_required": False,
         "berechnungs_modus": "Detail",
     },
@@ -108,22 +114,19 @@ DEFAULTS = {
         }
     ],
     "pv": {
-        # pro Feld: roof_id, hersteller, typ, watt_pro_modul, anzahl_module, datasheet
-        "felder": [],
-        # pro WR: modell, ac_kw, datasheet
-        "wr": [],
+        "felder": [],  # roof_id, hersteller, typ, watt_pro_modul, anzahl_module, datasheet
+        "wr": [],      # modell, ac_kw, datasheet
         "konzept": "Überschusseinspeisung",
         "total_kwp": 0.0,
         "total_ac_kw": 0.0,
     },
     "speicher": {
         "hersteller": "",
-        "kap": 0.0,     # kWh
-        "p": 0.0,       # kW
+        "kap": 0.0,
+        "p": 0.0,
         "spannung": "Hochvolt",
         "datasheet": "",
         "objective": "Eigenverbrauch/Autarkie",
-        # neue Felder
         "min_soc_pct": 10.0,
         "cycle_life": 6000,
         "calendar_life_years": 15,
@@ -131,8 +134,7 @@ DEFAULTS = {
         "eta_roundtrip": 0.92,
         "arbitrage": {
             "enabled": False,
-            "mode": "Manuell",  # Manuell | Auto
-            # Manual params (Fallback)
+            "mode": "Manuell",
             "low_price": 0.18,
             "high_price": 0.32,
             "spread": 0.14,
@@ -140,7 +142,6 @@ DEFAULTS = {
             "roundtrip_eff": 0.90,
             "dod": 0.90,
             "degradation_eur_per_kwh_throughput": 0.03,
-            # Auto-Fetch Settings
             "source": "SMARD (DE/LU)",
             "smard_series_id": 8004169,
             "smard_region": "DE-LU",
@@ -154,11 +155,11 @@ DEFAULTS = {
             "price_csv_unit": "EUR/kWh",
             "continuous_soc": True,
             "soc_grid_points": 201,
-            # NEU: Terminal / Rolling Horizon
-            "terminal_mode": "End-SOC = SOC_min",            # oder "End-SOC frei (kein Restwert)" / "End-SOC frei (mit Restwert)"
-            "terminal_value_mode": "Auto (letzter Preis)",   # oder "Manuell"
-            "terminal_value_eur_per_kwh": 0.25,              # nur bei Manuell
-            # Cached results
+            # Terminal / Rolling Horizon
+            "terminal_mode": "End-SOC = SOC_min",
+            "terminal_value_mode": "Auto (letzter Preis)",
+            "terminal_value_eur_per_kwh": 0.25,
+            # Cached
             "prices_cached": False,
             "prices_last_fetch": "",
             "schedule_file": "",
@@ -168,8 +169,8 @@ DEFAULTS = {
         },
     },
     "mobilität": {
-        "ladepunkte": [],   # name, leistung_kw, datasheet
-        "fuhrpark": [],     # klasse, anzahl, km_pro_jahr, kwh_pro_100km, l_pro_100km, datasheet
+        "ladepunkte": [],
+        "fuhrpark": [],
         "total_ev_kwh": 0.0,
     },
     "wirtschaft": {
@@ -254,10 +255,8 @@ def ensure_roof_ids(d: dict):
 
 
 def migrate_legacy(d: dict):
-    # Tech (hak_mode / hak_kw)
     d.setdefault("tech", {})
     deep_merge(d["tech"], DEFAULTS["tech"])
-    # wenn hak_kw leer -> aus Ampere ableiten
     if not d["tech"].get("hak_kw"):
         d["tech"]["hak_kw"] = round(_hak_kw_from_ampere(float(d["tech"].get("hak_ampere", 63))), 1)
 
@@ -282,7 +281,6 @@ def migrate_legacy(d: dict):
         }]
     ensure_roof_ids(d)
 
-    # PV container
     d.setdefault("pv", {})
     deep_merge(d["pv"], DEFAULTS["pv"])
 
@@ -327,7 +325,6 @@ def migrate_legacy(d: dict):
             })
     d["pv"]["felder"] = fields_new
 
-    # Speicher + Wirtschaft + Mobilität deep merge
     d.setdefault("speicher", {})
     deep_merge(d["speicher"], DEFAULTS["speicher"])
     d.setdefault("wirtschaft", {})
@@ -515,7 +512,7 @@ def build_synth_pv_profile(index: pd.DatetimeIndex, pv_kwp: float, region: str, 
     if pv_kwp <= 0 or len(index) == 0:
         return pd.Series(index=index, data=np.zeros(len(index)))
 
-    spec = REGIONS.get(region, 1000)  # kWh/kWp/a
+    spec = REGIONS.get(region, 1000)
     pv_year = pv_kwp * spec
 
     n = len(index)
@@ -551,7 +548,6 @@ def build_ev_profile(index: pd.DatetimeIndex, ev_kwh_year: float, seed: int) -> 
 
 
 def build_synth_load(index: pd.DatetimeIndex, annual_kwh: float, seed: int) -> pd.Series:
-    """Fallback, wenn kein Lastgang vorhanden: synthetisches Lastprofil in kWh/step."""
     rng = np.random.default_rng(seed + 777)
     n = len(index)
     if n == 0:
@@ -788,9 +784,9 @@ def _dp_optimize_horizon(
     """
     Globales DP über gesamten Horizont (SOC carry-over).
     Terminal-Optionen:
-      - "End-SOC = SOC_min"               => Endzustand fix soc_min
-      - "End-SOC frei (kein Restwert)"    => Endzustand frei, kein Wert
-      - "End-SOC frei (mit Restwert)"     => Endzustand frei, Restwert für SOC über SOC_min
+      - "End-SOC = SOC_min"
+      - "End-SOC frei (kein Restwert)"
+      - "End-SOC frei (mit Restwert)"
     """
     T = len(prices_eur_per_kwh)
     if T == 0:
@@ -822,10 +818,9 @@ def _dp_optimize_horizon(
         v_next[0] = 0.0
     elif terminal_mode == "End-SOC frei (mit Restwert)":
         tv = max(float(terminal_value_eur_per_kwh), 0.0)
-        # Restwert nur über SOC_min (vermeidbare Reserve nicht "bewerten")
         salvage = np.maximum(levels - soc_min, 0.0) * tv * eff_d
         v_next = salvage.astype(float)
-    else:  # "End-SOC frei (kein Restwert)"
+    else:
         v_next = np.zeros(N, dtype=float)
 
     best_next = np.full((T, N), -1, dtype=np.int16)
@@ -881,7 +876,7 @@ def _dp_optimize_horizon(
 
         v_next = v_cur
 
-    # Start-SOC: soc_min (konservativ). Du kannst später optional "start_soc_pct" ergänzen.
+    # Start-SOC: soc_min
     soc = np.zeros(T + 1, dtype=float)
     grid_ch = np.zeros(T, dtype=float)
     grid_dis = np.zeros(T, dtype=float)
@@ -913,7 +908,6 @@ def _dp_optimize_horizon(
         soc[t + 1] = soc_j
         idx_soc = j
 
-    # Falls Terminal "mit Restwert": DP hat den Restwert schon eingerechnet.
     return float(profit), soc, grid_ch, grid_dis
 
 
@@ -972,6 +966,74 @@ def optimize_arbitrage_continuous(
         "cycles_year": float(cycles_year),
         "schedule_df": schedule_df,
         "days_used": int(round(days)),
+    }
+
+
+def optimize_arbitrage_daily_reset(
+    prices_hourly_eur_per_kwh: pd.Series,
+    cap_kwh: float,
+    p_kw: float,
+    dod: float,
+    roundtrip_eff: float,
+    deg_cost_per_kwh_throughput: float,
+    soc_grid_points: int,
+) -> dict:
+    """Einfacher Tages-Reset: pro Tag separat optimieren (Start/Ende SOC_min)."""
+    ser = _to_hourly_prices(prices_hourly_eur_per_kwh).dropna()
+    if ser.empty:
+        return {"profit_year": 0.0, "throughput_year": 0.0, "cycles_year": 0.0, "schedule_df": pd.DataFrame(), "days_used": 0}
+
+    chunks = []
+    total_profit = 0.0
+    total_throughput = 0.0
+
+    by_date = ser.groupby(ser.index.date)
+    for _, sday in by_date:
+        if len(sday) < 2:
+            continue
+        prices = sday.values.astype(float)
+        profit, soc, grid_ch, grid_dis = _dp_optimize_horizon(
+            prices_eur_per_kwh=prices,
+            cap_kwh=cap_kwh,
+            p_kw=p_kw,
+            dod=dod,
+            roundtrip_eff=roundtrip_eff,
+            deg_cost_per_kwh_throughput=deg_cost_per_kwh_throughput,
+            soc_grid_points=soc_grid_points,
+            terminal_mode="End-SOC = SOC_min",
+            terminal_value_eur_per_kwh=0.0,
+        )
+        deltas = np.diff(soc)
+        throughput = float(np.sum(np.abs(deltas)))
+        total_profit += profit
+        total_throughput += throughput
+
+        df = pd.DataFrame({
+            "timestamp": sday.index,
+            "price_eur_per_kwh": prices,
+            "soc_kwh": soc[:-1],
+            "soc_next_kwh": soc[1:],
+            "grid_charge_kwh": grid_ch,
+            "grid_discharge_kwh": grid_dis,
+        }).set_index("timestamp")
+        chunks.append(df)
+
+    schedule_df = pd.concat(chunks).sort_index() if chunks else pd.DataFrame()
+
+    # Annualisieren nach tatsächlicher Tagezahl
+    days = max(len(by_date), 1)
+    profit_year = (total_profit / days) * 365.0
+    throughput_year = (total_throughput / days) * 365.0
+
+    usable = max(cap_kwh * float(np.clip(dod, 0.10, 1.0)), 1e-9)
+    cycles_year = throughput_year / (2.0 * usable)
+
+    return {
+        "profit_year": float(profit_year),
+        "throughput_year": float(throughput_year),
+        "cycles_year": float(cycles_year),
+        "schedule_df": schedule_df,
+        "days_used": int(days),
     }
 
 
@@ -1237,11 +1299,8 @@ def export_pdf(report_path: Path, d: dict, sim_kpis: dict):
 
 
 def generate_index_html(project_slug: str, d: dict, created_ts: str, docs_root: Path) -> str:
-    # Links im ZIP beziehen sich auf Pfade wie "projects/<slug>/documents/..."
     base = f"projects/{project_slug}/documents"
     files = sorted([p for p in docs_root.rglob("*.*") if p.is_file()], key=lambda x: x.as_posix())
-
-    # Reports prominent
     reports = [p for p in files if "/reports/" in p.as_posix().replace("\\", "/")]
     atts = collect_attachments(d)
 
@@ -1278,11 +1337,7 @@ def generate_index_html(project_slug: str, d: dict, created_ts: str, docs_root: 
     else:
         for a in atts:
             p = a.get("path", "")
-            # pfad im zip: projects/<slug>/... wenn es darunter liegt
-            if p.startswith("projects/"):
-                rel = p.replace("\\", "/")
-            else:
-                rel = p.replace("\\", "/")
+            rel = p.replace("\\", "/")
             html.append(li(rel, f"[{a.get('type','')}] {a.get('name','')}"))
     html.append("</ul>")
 
@@ -1315,7 +1370,7 @@ def build_zip_package(zip_path: Path, files: list[Path], extra_bytes: dict[str, 
     return zip_path
 
 
-def gather_project_package_files(project_base: Path, docs_root: Path, state_file: Path) -> list[Path]:
+def gather_project_package_files(docs_root: Path, state_file: Path) -> list[Path]:
     files: list[Path] = []
     if state_file.exists():
         files.append(state_file)
@@ -1374,7 +1429,12 @@ with st.sidebar:
 
     st.divider()
     st.header("⚡ Gebäudeanschluss")
-    d["tech"]["hak_mode"] = st.radio("Eingabeart", HAK_MODE_OPTIONS, index=safe_index(HAK_MODE_OPTIONS, d["tech"].get("hak_mode", "Ampere"), 0), horizontal=True)
+    d["tech"]["hak_mode"] = st.radio(
+        "Eingabeart",
+        HAK_MODE_OPTIONS,
+        index=safe_index(HAK_MODE_OPTIONS, d["tech"].get("hak_mode", "Ampere"), 0),
+        horizontal=True
+    )
 
     if d["tech"]["hak_mode"] == "Ampere":
         d["tech"]["hak_ampere"] = st.selectbox(
@@ -1385,7 +1445,12 @@ with st.sidebar:
         hak_kw = _hak_kw_from_ampere(float(d["tech"]["hak_ampere"]))
         d["tech"]["hak_kw"] = round(float(hak_kw), 1)
     else:
-        d["tech"]["hak_kw"] = st.number_input("HAK Größe (kW)", 1.0, 20000.0, float(d["tech"].get("hak_kw", _hak_kw_from_ampere(63))), step=1.0)
+        d["tech"]["hak_kw"] = st.number_input(
+            "HAK Größe (kW)",
+            1.0, 20000.0,
+            float(d["tech"].get("hak_kw", _hak_kw_from_ampere(63))),
+            step=1.0
+        )
         hak_kw = float(d["tech"]["hak_kw"])
         d["tech"]["hak_ampere"] = _hak_ampere_from_kw(hak_kw)
 
@@ -1427,6 +1492,7 @@ if "PV-System" in d["scope"]:
 
         with st.container(border=True):
             st.subheader("Dachflächen (inkl. PV-kWp manuell je Dach)")
+
             c_add, c_info = st.columns([1, 3])
             with c_add:
                 if st.button("➕ Dachfläche hinzufügen"):
@@ -1460,14 +1526,51 @@ if "PV-System" in d["scope"]:
                     r["azimut"] = c4.number_input("Azimut (°)", -180, 180, int(r.get("azimut", 0)), key=f"roof_az_{i}")
 
                     c5, c6, c7, c8 = st.columns([1, 1, 1, 1])
-                    r["breite"] = c5.number_input("Breite (m)", 0.0, 500.0, float(r.get("breite", 10.0)), key=f"roof_w_{i}")
-                    r["tiefe"] = c6.number_input("Tiefe/Höhe (m)", 0.0, 200.0, float(r.get("tiefe", 6.0)), key=f"roof_d_{i}")
+                    r["breite"] = c5.number_input("Breite (m)", 0.0, 5000.0, float(r.get("breite", 10.0)), key=f"roof_w_{i}")
+                    r["tiefe"] = c6.number_input("Tiefe/Höhe (m)", 0.0, 5000.0, float(r.get("tiefe", 6.0)), key=f"roof_d_{i}")
                     r["flaeche_auto"] = c7.checkbox("Fläche auto", value=bool(r.get("flaeche_auto", True)), key=f"roof_auto_{i}")
+
+                    # --- Fläche sicher anzeigen (auch > 10.000 m²) + Plausibilität ---
+                    auto_area = float(roof_area(r))
+                    # UI-Max dynamisch: mindestens 10.000, aber immer groß genug für den Auto-Wert
+                    max_area_ui = max(10_000.0, min(auto_area + 1.0, PLAUS_ROOF_AREA_HARD))
+
                     if r["flaeche_auto"]:
-                        r["flaeche"] = float(roof_area(r))
-                        c8.number_input("Fläche (m²)", 0.0, 10000.0, float(r["flaeche"]), disabled=True, key=f"roof_area_{i}")
+                        r["flaeche"] = auto_area
+                        c8.number_input(
+                            "Fläche (m²)",
+                            min_value=0.0,
+                            max_value=max_area_ui,
+                            value=float(r["flaeche"]),
+                            disabled=True,
+                            key=f"roof_area_{i}",
+                        )
                     else:
-                        r["flaeche"] = c8.number_input("Fläche (m²)", 0.0, 10000.0, float(r.get("flaeche", roof_area(r))), key=f"roof_area_{i}")
+                        r["flaeche"] = c8.number_input(
+                            "Fläche (m²)",
+                            min_value=0.0,
+                            max_value=PLAUS_ROOF_AREA_HARD,
+                            value=float(r.get("flaeche", auto_area)),
+                            key=f"roof_area_{i}",
+                        )
+
+                    # Plausibilitäts-Warnungen (weich)
+                    wv = float(r.get("breite", 0.0) or 0.0)
+                    dv = float(r.get("tiefe", 0.0) or 0.0)
+                    av = float(r.get("flaeche", 0.0) or 0.0)
+
+                    if wv > PLAUS_ROOF_W_MAX or dv > PLAUS_ROOF_D_MAX:
+                        st.warning(
+                            f"⚠️ Plausibilität: sehr große Dachabmessungen (Breite {wv:.1f} m / Tiefe {dv:.1f} m). "
+                            f"Bitte prüfen, ob Einheiten/Komma stimmen."
+                        )
+                    if av > PLAUS_ROOF_AREA_WARN:
+                        st.warning(
+                            f"⚠️ Plausibilität: Dachfläche {av:,.0f} m² ist sehr groß. "
+                            f"Falls das ein Areal/Standort ist: ok – sonst Eingabe prüfen."
+                        )
+                    if av >= PLAUS_ROOF_AREA_HARD:
+                        st.error("🚨 Dachfläche erreicht das UI-Limit. Bitte Werte prüfen/aufteilen in mehrere Dächer.")
 
                     c9, c10, c11 = st.columns([1, 1, 1])
                     r["nutzfaktor"] = c9.slider("Nutzfaktor", 0.30, 0.95, float(r.get("nutzfaktor", 0.80)), 0.01, key=f"roof_nf_{i}")
@@ -1485,6 +1588,8 @@ if "PV-System" in d["scope"]:
                     kB.metric("Zugeordnet", f"{used_mod:,} Module")
                     kC.metric("PV-kWp (Dach)", f"{pv_dach_kwp:.2f} kWp")
 
+                    if cap_mod > PLAUS_ROOF_MOD_WARN:
+                        st.warning(f"⚠️ Plausibilität: sehr hohe Modulkapazität ({cap_mod:,} Module). Prüfe Fläche/Nutzfaktor/Modulfläche.")
                     if used_mod > cap_mod and cap_mod > 0 and not bool(r.get("pv_kwp_manual_enabled")):
                         st.warning("⚠️ Dach überbelegt (grob). Nutzfaktor/Modulfläche/Modulanzahl prüfen.")
 
@@ -1501,7 +1606,6 @@ if "PV-System" in d["scope"]:
                         for f in d["pv"]["felder"]:
                             if f.get("roof_id") not in keep_roof_ids:
                                 f["roof_id"] = fallback_id
-                        # falls gelöschtes Dach noch referenziert wird (safety)
                         if deleted_id and deleted_id not in keep_roof_ids:
                             for f in d["pv"]["felder"]:
                                 if f.get("roof_id") == deleted_id:
@@ -1648,8 +1752,8 @@ if "Speicher" in d["scope"]:
                 st.write(f"Typ: **{rec['typ']}**")
                 if rec["ems"]:
                     st.warning("EMS/Lastmanagement empfohlen.")
-                for r in rec["reasons"]:
-                    st.write(f"- {r}")
+                for rr in rec["reasons"]:
+                    st.write(f"- {rr}")
                 if st.button("✅ Empfehlung übernehmen", use_container_width=True):
                     s["kap"] = rec["rec_kwh"]
                     s["p"] = rec["rec_kw"]
@@ -1685,7 +1789,6 @@ if "Speicher" in d["scope"]:
             bat_kwh = float(s.get("kap", 0.0))
             bat_kw = float(s.get("p", 0.0))
 
-            # Terminal / Rolling Horizon
             st.subheader("Terminal / Rolling Horizon")
             term_opts = ["End-SOC = SOC_min", "End-SOC frei (kein Restwert)", "End-SOC frei (mit Restwert)"]
             arbd["terminal_mode"] = st.selectbox("Terminal-Modus", term_opts, index=safe_index(term_opts, arbd.get("terminal_mode", term_opts[0]), 0))
@@ -1694,7 +1797,8 @@ if "Speicher" in d["scope"]:
             if arbd["terminal_value_mode"] == "Manuell":
                 arbd["terminal_value_eur_per_kwh"] = st.number_input("Restwert (€/kWh)", 0.0, 2.0, float(arbd.get("terminal_value_eur_per_kwh", 0.25)))
 
-            st.caption("„Mit Restwert“ bedeutet: Restenergie im Speicher wird am Horizont mit einem €/kWh bewertet (Rolling Horizon Näherung).")
+            arbd["continuous_soc"] = st.checkbox("Kontinuierlich (SOC carry-over)", value=bool(arbd.get("continuous_soc", True)))
+            st.caption("Tipp: „End-SOC frei (mit Restwert)“ + kontinuierlich ist eine gute Rolling-Horizon-Näherung.")
 
             if arbd["mode"] == "Manuell":
                 c5, c6, c7 = st.columns(3)
@@ -1706,7 +1810,7 @@ if "Speicher" in d["scope"]:
                 st.metric("Arbitrage-Potenzial (grob, €/a)", f"{profit:,.0f}")
                 st.caption("Manual ist eine Faustformel. Für echte Optimierung: Auto-Modus.")
             else:
-                st.info("Auto: holt Stundenpreise und optimiert den Charge/Discharge-Plan (kontinuierlich, SOC carry-over).")
+                st.info("Auto: holt Stundenpreise und optimiert den Charge/Discharge-Plan.")
 
                 arbd["source"] = st.selectbox(
                     "Quelle",
@@ -1720,7 +1824,6 @@ if "Speicher" in d["scope"]:
                 arbd["low_quantile"] = c10.number_input("Low-Quantil (Info)", 0.0, 0.5, float(arbd.get("low_quantile", 0.20)))
                 arbd["high_quantile"] = c11.number_input("High-Quantil (Info)", 0.5, 1.0, float(arbd.get("high_quantile", 0.80)))
 
-                arbd["continuous_soc"] = st.checkbox("Kontinuierlich optimieren (SOC carry-over)", value=bool(arbd.get("continuous_soc", True)))
                 arbd["soc_grid_points"] = st.slider("SOC-Gitter (Genauigkeit vs. Speed)", 101, 401, int(arbd.get("soc_grid_points", 201)), 50)
 
                 price_series = None
@@ -1781,27 +1884,37 @@ if "Speicher" in d["scope"]:
                         else:
                             arbitrage_fill_info_from_prices(arbd, ser)
 
-                            # Terminal Restwert ableiten
                             terminal_value = 0.0
                             if arbd["terminal_mode"] == "End-SOC frei (mit Restwert)":
                                 if arbd.get("terminal_value_mode") == "Manuell":
                                     terminal_value = float(arbd.get("terminal_value_eur_per_kwh", 0.0) or 0.0)
                                 elif arbd.get("terminal_value_mode") == "Auto (Ø letzte 24h)":
                                     terminal_value = float(ser.tail(24).mean()) if len(ser) >= 1 else float(ser.iloc[-1])
-                                else:  # Auto letzter Preis
+                                else:
                                     terminal_value = float(ser.iloc[-1])
 
-                            res = optimize_arbitrage_continuous(
-                                prices_hourly_eur_per_kwh=ser,
-                                cap_kwh=bat_kwh,
-                                p_kw=bat_kw,
-                                dod=float(arbd.get("dod", 0.90)),
-                                roundtrip_eff=float(arbd.get("roundtrip_eff", 0.90)),
-                                deg_cost_per_kwh_throughput=float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)),
-                                soc_grid_points=int(arbd.get("soc_grid_points", 201)),
-                                terminal_mode=str(arbd.get("terminal_mode", "End-SOC = SOC_min")),
-                                terminal_value_eur_per_kwh=float(terminal_value),
-                            )
+                            if bool(arbd.get("continuous_soc", True)):
+                                res = optimize_arbitrage_continuous(
+                                    prices_hourly_eur_per_kwh=ser,
+                                    cap_kwh=bat_kwh,
+                                    p_kw=bat_kw,
+                                    dod=float(arbd.get("dod", 0.90)),
+                                    roundtrip_eff=float(arbd.get("roundtrip_eff", 0.90)),
+                                    deg_cost_per_kwh_throughput=float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)),
+                                    soc_grid_points=int(arbd.get("soc_grid_points", 201)),
+                                    terminal_mode=str(arbd.get("terminal_mode", "End-SOC = SOC_min")),
+                                    terminal_value_eur_per_kwh=float(terminal_value),
+                                )
+                            else:
+                                res = optimize_arbitrage_daily_reset(
+                                    prices_hourly_eur_per_kwh=ser,
+                                    cap_kwh=bat_kwh,
+                                    p_kw=bat_kw,
+                                    dod=float(arbd.get("dod", 0.90)),
+                                    roundtrip_eff=float(arbd.get("roundtrip_eff", 0.90)),
+                                    deg_cost_per_kwh_throughput=float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)),
+                                    soc_grid_points=int(arbd.get("soc_grid_points", 201)),
+                                )
 
                             arbd["annual_profit_est"] = round(float(res["profit_year"]), 2)
                             arbd["annual_throughput_kwh"] = round(float(res["throughput_year"]), 1)
@@ -2127,15 +2240,11 @@ with tabs[ti]:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 zip_out = REPORTS / f"package_{P_SLUG}_{ts}.zip"
 
-                # Index.html erzeugen (zusätzlich lokal ablegen)
                 idx_html = generate_index_html(P_SLUG, d, ts, DOCS)
                 idx_local = REPORTS / f"index_{P_SLUG}_{ts}.html"
                 idx_local.write_text(idx_html, encoding="utf-8")
 
-                # Dateien sammeln
-                files = gather_project_package_files(BASE, DOCS, STATE_FILE)
-
-                # index.html zusätzlich in ZIP-Root (bequemer)
+                files = gather_project_package_files(DOCS, STATE_FILE)
                 build_zip_package(zip_out, files, extra_bytes={"index.html": idx_html.encode("utf-8")})
 
                 st.success(f"Erzeugt: {zip_out}")
