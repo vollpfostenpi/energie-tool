@@ -1,16 +1,15 @@
 import streamlit as st
 import json
 import os
-import shutil
 import pandas as pd
 import numpy as np
 from datetime import datetime
 
 # =================================================================
-# 1. KONFIGURATION & DATEI-MANAGEMENT (DSGVO-KONFORM LOKAL)
+# 1. INITIALISIERUNG & PERSISTENZ-LAYER
 # =================================================================
 if "active_slug" not in st.session_state:
-    st.error("⚠️ Kein aktives Projekt geladen. Bitte Projekt in der Übersicht wählen.")
+    st.error("⚠️ Kein aktives Projekt gefunden. Bitte im Dashboard starten.")
     st.stop()
 
 P_SLUG = st.session_state["active_slug"]
@@ -19,269 +18,330 @@ STATE_FILE = os.path.join(P_PATH, "state.json")
 DOC_PATH = os.path.join(P_PATH, "documents")
 os.makedirs(DOC_PATH, exist_ok=True)
 
-# Daten laden & Migration
-with open(STATE_FILE, "r", encoding="utf-8") as f:
-    d = json.load(f)
+# Lade Daten aus der JSON in den Session State
+if "project_data" not in st.session_state:
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        st.session_state["project_data"] = json.load(f)
 
-# Struktur-Check (Deep Initialization)
-sections = {
-    "pv": {"felder": [], "wr": [], "kabel_verlust": 2.0, "degradation": 0.5},
-    "speicher": {"kap": 0.0, "p": 0.0, "zyklen": 6000, "dod": 90, "eff": 95, "temp_faktor": 1.0},
-    "mobilität": {"lp": [], "fuhrpark": []},
-    "finanzen": {"invest": 0.0, "strom_preis": 0.32, "einspeisung": 0.08, "diesel_preis": 1.78, "wartung_pa": 1.5}
+d = st.session_state["project_data"]
+
+# Migration / Datenstruktur-Check (Verhindert KeyError bei Upgrades)
+def ensure_keys(data, defaults):
+    for k, v in defaults.items():
+        if k not in data:
+            data[k] = v
+        elif isinstance(v, dict):
+            ensure_keys(data[k], v)
+
+defaults = {
+    "scope": ["PV-System", "Speicher", "Ladeinfrastruktur"],
+    "tech": {"hak_ampere": 63, "hak_kva": 43.6, "ems_needed": False, "mode": "Detail"},
+    "dach": {"form": "Satteldach", "breite": 10.0, "tiefe": 6.0, "flaeche": 60.0, "neigung": 35, "azimut": 0},
+    "pv": {"felder": [], "wr": [], "konzept": "Überschusseinspeisung", "total_kwp": 0.0},
+    "speicher": {"kap": 0.0, "p": 0.0, "hersteller": "", "typ": "", "db_file": None},
+    "mobilität": {"wallboxen": [], "fuhrpark": []},
+    "wirtschaft": {"strompreis": 0.35, "dieselpreis": 1.75, "einspeise_v": 0.08, "last_jahr": 5000}
 }
-for key, val in sections.items():
-    if key not in d: d[key] = val
+ensure_keys(d, defaults)
 
-def save_state():
+def save():
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=4, ensure_ascii=False)
 
-def upload_handler(file, label):
+def upload_handler(file, prefix):
     if file:
-        fname = f"{label}_{file.name.replace(' ', '_')}"
+        fname = f"{prefix}_{file.name.replace(' ', '_')}"
         with open(os.path.join(DOC_PATH, fname), "wb") as f:
             f.write(file.getbuffer())
         return fname
     return None
 
-st.set_page_config(page_title="Professional Energy Engineering", layout="wide")
+st.set_page_config(page_title="Technische Fachplanung", layout="wide", page_icon="🏗️")
 
 # =================================================================
-# 2. KI-INTEGRATION & MARKT-DATABASE 2026
+# 2. KI-SIMULATIONS-ENGINE (PHYSIKALISCHES MODELL)
 # =================================================================
-# Diese Daten dienen als Basis für die automatisierten Rechner
-MARKET_DATA = {
-    "THG_2026": {"PKW": 165.0, "N1": 280.0, "N2": 3400.0, "N3": 5800.0, "Bus": 12500.0},
-    "CONSUMPTION": {
-        "PKW": {"e": 18.2, "d": 6.4, "service_e": 350, "service_d": 750, "tax_d": 250},
-        "N1": {"e": 27.5, "d": 9.2, "service_e": 500, "service_d": 1100, "tax_d": 400},
-        "N2": {"e": 72.0, "d": 17.5, "service_e": 1200, "service_d": 2800, "tax_d": 1200},
-        "N3": {"e": 118.0, "d": 31.0, "service_e": 2500, "service_d": 6500, "tax_d": 3500},
-        "Bus": {"e": 132.0, "d": 35.5, "service_e": 3000, "service_d": 8000, "tax_d": 1500}
-    },
-    "SUN_HOURS": {"Nord": 940, "Süd": 1180, "Ost": 1050, "West": 1020}
-}
-
-# =================================================================
-# 3. MATHEMATISCHE CORE-FUNKTIONEN (THE RECKONER)
-# =================================================================
-def calc_lcoe(invest, yield_pa, years=20):
-    """Berechnet die Stromgestehungskosten (Levelized Cost of Energy)."""
-    # Vereinfachte Formel für LCOE
-    total_yield = sum([yield_pa * ((1 - (d['pv']['degradation']/100))**y) for y in range(years)])
-    return invest / total_yield if total_yield > 0 else 0
-
-def calc_npv(invest, cashflows, rate=0.04):
-    """Berechnet den Kapitalwert (Net Present Value)."""
-    npv = -invest
-    for t, cf in enumerate(cashflows):
-        npv += cf / ((1 + rate) ** (t + 1))
-    return npv
-
-# =================================================================
-# 4. BENUSEROBERFLÄCHE (UI)
-# =================================================================
-st.title("🛡️ Enterprise Fachplanung & Simulation")
-st.subheader(f"Projekt: {d['metadata']['id']} | Kunde: {d['kunde']['name']}")
-
-# SIDEBAR FÜR GLOBALE PARAMETER
-with st.sidebar:
-    st.header("⚙️ Globale Parameter")
-    d['finanzen']['strom_preis'] = st.number_input("Strompreis (Bezug) €/kWh", 0.0, 1.0, d['finanzen']['strom_preis'])
-    d['finanzen']['diesel_preis'] = st.number_input("Dieselpreis €/L", 0.0, 5.0, d['finanzen']['diesel_preis'])
-    d['finanzen']['zins_satz'] = st.slider("Kalk. Zinssatz (%)", 0.0, 10.0, 4.0) / 100
-    if st.button("💾 Stand jetzt sichern"):
-        save_state()
-        st.success("Lokal gespeichert.")
-
-tabs = st.tabs(["☀️ PV-Engineering", "🔋 Speicher-Setup", "🔌 Mobilität & Fuhrpark", "📊 Ertrags-Analyse", "💰 ROI & TCO"])
-
-# -----------------------------------------------------------------
-# TAB 1: PV-ENGINEERING
-# -----------------------------------------------------------------
-with tabs[0]:
-    st.header("Photovoltaik-Systemdesign")
-    c_p1, c_p2 = st.columns([2, 1])
+def run_simulation(pv_kwp, last_jahr, bat_kwh, ev_kwh, region="Mitte"):
+    # Standort-Faktoren (Globalstrahlung 2026 Prognose)
+    yield_map = {"Nord": 920, "Mitte": 1040, "Süd": 1160}
+    spec_yield = yield_map.get(region, 1000)
     
-    with c_p1:
-        st.markdown("### Modulfelder (Generatoren)")
-        if st.button("➕ Neues Modulfeld"):
-            d['pv']['felder'].append({"h": "Hersteller", "t": "Typ", "wp": 440, "n": 24, "az": 0, "ne": 35})
-        
-        for i, f in enumerate(d['pv']['felder']):
-            with st.container(border=True):
-                col1, col2, col3 = st.columns([2, 1, 1])
-                f['h'] = col1.text_input("Hersteller", f['h'], key=f"pvh_{i}")
-                f['t'] = col2.text_input("Typ", f['t'], key=f"pvt_{i}")
-                f['wp'] = col3.number_input("Leistung (Wp)", 100, 800, f['wp'], key=f"pvw_{i}")
-                
-                col4, col5, col6, col7 = st.columns(4)
-                f['n'] = col4.number_input("Anzahl", 1, 10000, f['n'], key=f"pvn_{i}")
-                f['az'] = col5.number_input("Azimut (°)", -180, 180, f['az'], key=f"pvaz_{i}")
-                f['ne'] = col6.number_input("Neigung (°)", 0, 90, f['ne'], key=f"pvne_{i}")
-                if col7.button("🗑️", key=f"pvdel_{i}"):
-                    d['pv']['felder'].pop(i); st.rerun()
-                
-                up_mod = st.file_uploader("Datenblatt Modul", type=["pdf"], key=f"pvup_{i}")
-                if up_mod: f['db'] = upload_handler(up_mod, f"Modul_Feld_{i}")
+    # Zeitreihen (365 Tage)
+    days = 365
+    t = np.linspace(0, 1, days)
+    
+    # PV-Erzeugung (Saisonale Glockenkurve + Wetter-Rauschen)
+    pv_gen = (np.sin(np.pi * t - np.pi/10)**2 + 0.1) * (pv_kwp * spec_yield / 180)
+    pv_gen = np.maximum(pv_gen * np.random.normal(1, 0.2, days), 0)
+    
+    # Lastgang (Winter-Peak für Gebäude)
+    load_base = (np.cos(2 * np.pi * t) * 0.2 + 1.0) * (last_jahr / days)
+    load_ev = (ev_kwh / days) * np.random.normal(1, 0.4, days)
+    load_total = load_base + load_ev
+    
+    # Batteriesimulation (Ladestands-Algorithmus)
+    soc = 0
+    self_supply = []
+    feed_in = []
+    
+    for p, l in zip(pv_gen, load_total):
+        diff = p - l
+        if diff > 0: # Überschuss
+            charge = min(diff, bat_kwh - soc)
+            soc += charge
+            feed_in.append(diff - charge)
+            self_supply.append(l)
+        else: # Defizit
+            discharge = min(abs(diff), soc)
+            soc -= discharge
+            self_supply.append(p + discharge)
+            feed_in.append(0)
+            
+    return pd.DataFrame({
+        "PV": pv_gen, "Last": load_total, "Eigen": self_supply, "Einspeisung": feed_in
+    }, index=pd.date_range("2026-01-01", periods=days))
 
-    with c_p2:
-        st.markdown("### Wechselrichter & Verluste")
-        if st.button("➕ Wechselrichter"):
-            d['pv']['wr'].append({"h": "Brand", "p": 20.0, "n": 1})
-        for j, w in enumerate(d['pv']['wr']):
-            with st.container(border=True):
-                w['h'] = st.text_input("Hersteller/Modell", w['h'], key=f"wrh_{j}")
-                c_w1, c_w2 = st.columns(2)
-                w['p'] = c_w1.number_input("Leistung (kW)", 0.1, 2000.0, w['p'], key=f"wrp_{j}")
-                w['n'] = c_w2.number_input("Stück", 1, 100, w['n'], key=f"wrn_{j}")
-                if st.button("🗑️", key=f"wrdel_{j}"):
-                    d['pv']['wr'].pop(j); st.rerun()
+# =================================================================
+# 3. SIDEBAR: SCOPE & HAK
+# =================================================================
+with st.sidebar:
+    st.header("⚙️ Projekt-Umfang")
+    d['scope'] = st.multiselect("Module aktivieren:", ["PV-System", "Speicher", "Ladeinfrastruktur"], default=d['scope'])
+    
+    st.divider()
+    st.header("🔌 Gebäudeanschluss")
+    hak_vals = [35, 50, 63, 80, 100, 125, 160, 250, 400]
+    d['tech']['hak_ampere'] = st.selectbox("HAK Sicherung (A)", hak_vals, index=hak_vals.index(d['tech']['hak_ampere']))
+    d['tech']['hak_kva'] = (d['tech']['hak_ampere'] * 400 * 1.732) / 1000
+    st.metric("Verfügbare Leistung", f"{d['tech']['hak_kva']:.1f} kVA")
+    
+    if st.button("💾 Stand speichern", use_container_width=True):
+        save()
+        st.success("Gespeichert!")
+
+# =================================================================
+# 4. TAB-LOGIK (DIE HAUPTMASCHINE)
+# =================================================================
+st.title(f"Planungstool: {d['kunde']['name']}")
+
+# Dynamische Tab-Erstellung
+active_tabs = []
+if "PV-System" in d['scope']: active_tabs.append("☀️ PV & Dach")
+if "Speicher" in d['scope']: active_tabs.append("🔋 Speicher")
+if "Ladeinfrastruktur" in d['scope']: active_tabs.append("🔌 Mobilität")
+active_tabs.append("📊 KI-Analyse & ROI")
+
+tabs = st.tabs(active_tabs)
+t_idx = 0
+
+# -----------------------------------------------------------------
+# TAB: PV & DACH
+# -----------------------------------------------------------------
+if "PV-System" in d['scope']:
+    with tabs[t_idx]:
+        # DACHKONFIGURATOR (GRAFISCH)
+        st.subheader("🏠 Dachgeometrie & Fläche")
+        c1, c2, c3 = st.columns([1, 1, 1])
+        
+        with c1:
+            st.write("**Dachform wählen**")
+            # Visuelle Auswahl über Radio mit Emojis
+            d['dach']['form'] = st.radio("Typ", ["Satteldach 🏠", "Flachdach 🏢", "Pultdach 📉", "Walmdach ⛺"], label_visibility="collapsed")
+        
+        with c2:
+            d['dach']['breite'] = st.number_input("Breite (m)", 0.0, 500.0, d['dach']['breite'])
+            d['dach']['tiefe'] = st.number_input("Tiefe/Höhe (m)", 0.0, 200.0, d['dach']['tiefe'])
+            d['dach']['flaeche'] = d['dach']['breite'] * d['dach']['tiefe']
+            st.caption(f"Gesamtfläche: {d['dach']['flaeche']:.1f} m²")
+
+        with c3:
+            d['dach']['neigung'] = st.slider("Dachneigung (°)", 0, 90, d['dach']['neigung'])
+            d['dach']['azimut'] = st.slider("Ausrichtung (Süd=0, West=90)", -180, 180, d['dach']['azimut'])
+
+        
+
+        st.divider()
+        
+        # HARDWARE DETAILPLANUNG
+        st.subheader("⚡ PV-Komponenten & Verschaltung")
+        
+        col_pv1, col_pv2 = st.columns(2)
+        
+        with col_pv1:
+            st.markdown("#### Modulfelder (Strings)")
+            if st.button("➕ Neues Feld"):
+                d['pv']['felder'].append({"h": "", "t": "", "w": 440, "n": 10, "db": None})
+            
+            total_kwp = 0
+            for i, f in enumerate(d['pv']['felder']):
+                with st.expander(f"Feld #{i+1}: {f['n']} Module", expanded=True):
+                    f['h'] = st.text_input("Hersteller", f['h'], key=f"f_h_{i}")
+                    f['t'] = st.text_input("Modultyp", f['t'], key=f"f_t_{i}")
+                    cf1, cf2 = st.columns(2)
+                    f['w'] = cf1.number_input("Leistung (Wp)", 100, 700, f['w'], key=f"f_w_{i}")
+                    f['n'] = cf2.number_input("Anzahl", 1, 5000, f['n'], key=f"f_n_{i}")
+                    
+                    up_m = st.file_uploader("Datenblatt PDF", type="pdf", key=f"f_up_{i}")
+                    if up_m: f['db'] = upload_handler(up_m, f"M{i}")
+                    
+                    total_kwp += (f['w'] * f['n']) / 1000
+                    if st.button("🗑️ Feld entfernen", key=f"f_del_{i}"):
+                        d['pv']['felder'].pop(i); st.rerun()
+            
+            d['pv']['total_kwp'] = total_kwp
+            st.metric("Gesamtleistung PV", f"{total_kwp:.2f} kWp")
+
+        with col_pv2:
+            st.markdown("#### Wechselrichter & Technik")
+            if st.button("➕ Wechselrichter"):
+                d['pv']['wr'].append({"h": "", "p": 10.0, "db": None})
+            
+            for j, w in enumerate(d['pv']['wr']):
+                with st.container(border=True):
+                    w['h'] = st.text_input("Modell", w['h'], key=f"w_h_{j}")
+                    w['p'] = st.number_input("AC-Leistung (kW)", 0.0, 500.0, w['p'], key=f"w_p_{j}")
+                    
+                    up_w = st.file_uploader("Datenblatt WR", type="pdf", key=f"w_up_{j}")
+                    if up_w: w['db'] = upload_handler(up_w, f"WR{j}")
+                    
+                    if st.button("🗑️ WR entfernen", key=f"w_del_{j}"):
+                        d['pv']['wr'].pop(j); st.rerun()
+
+    t_idx += 1
+
+# -----------------------------------------------------------------
+# TAB: SPEICHER
+# -----------------------------------------------------------------
+if "Speicher" in d['scope']:
+    with tabs[t_idx]:
+        st.header("🔋 Speichersystem")
+        cs1, cs2 = st.columns(2)
+        
+        with cs1:
+            s = d['speicher']
+            s['hersteller'] = st.text_input("Hersteller", s['hersteller'])
+            s['typ'] = st.text_input("Modell/Typ", s['typ'])
+            s['kap'] = st.number_input("Nettokapazität (kWh)", 0.0, 1000.0, s['kap'])
+            s['p'] = st.number_input("Ladeleistung (kW)", 0.0, 500.0, s['p'])
+            
+            up_s = st.file_uploader("Datenblatt Speicher", type="pdf")
+            if up_s: s['db_file'] = upload_handler(up_s, "BAT")
+            
+        with cs2:
+            st.subheader("🤖 KI-Empfehlung")
+            if d['pv']['total_kwp'] > 0:
+                rec = d['pv']['total_kwp'] * 1.1
+                st.info(f"Basierend auf {d['pv']['total_kwp']} kWp PV-Leistung empfehlen wir einen Speicher von ca. **{rec:.1f} kWh**.")
+                if s['kap'] > 0:
+                    delta = (s['kap'] / d['pv']['total_kwp'])
+                    if 0.8 <= delta <= 1.5: st.success("Dimensionierung ist optimal.")
+                    else: st.warning("Dimensionierung weicht vom Standard ab.")
+
+    t_idx += 1
+
+# -----------------------------------------------------------------
+# TAB: MOBILITÄT & FUHRPARK (VOLLSTÄNDIG)
+# -----------------------------------------------------------------
+if "Ladeinfrastruktur" in d['scope']:
+    with tabs[t_idx]:
+        st.header("🔌 Ladeinfrastruktur & E-Fuhrpark")
+        
+        # A. WALLBOXEN
+        st.subheader("1. Ladepunkte")
+        if st.button("➕ Ladepunkt"):
+            d['mobilität']['wallboxen'].append({"n": "Wallbox", "p": 11})
+        
+        total_wb_p = 0
+        for k, wb in enumerate(d['mobilität']['wallboxen']):
+            clp1, clp2, clp3 = st.columns([2, 1, 1])
+            wb['n'] = clp1.text_input("Hersteller/Modell", wb['n'], key=f"wb_n_{k}")
+            wb['p'] = clp2.selectbox("Leistung (kW)", [11, 22, 44, 150], index=0 if wb['p']==11 else 1, key=f"wb_p_{k}")
+            total_wb_p += wb['p']
+            if clp3.button("🗑️", key=f"wb_d_{k}"):
+                d['mobilität']['wallboxen'].pop(k); st.rerun()
+        
+        # HAK CHECK
+        if (total_wb_p + d['pv']['total_kwp']) > d['tech']['hak_kva']:
+            st.error(f"🚨 HAK Überlastung möglich! Gesamtleistung ({total_wb_p + d['pv']['total_kwp']:.1f} kW) > HAK ({d['tech']['hak_kva']:.1f} kVA). EMS zwingend!")
         
         st.divider()
-        d['pv']['kabel_verlust'] = st.slider("Kabelverluste AC/DC (%)", 0.5, 5.0, d['pv']['kabel_verlust'])
-        d['pv']['degradation'] = st.slider("Jährliche Degradation (%)", 0.1, 1.0, d['pv']['degradation'])
-
-# -----------------------------------------------------------------
-# TAB 2: SPEICHER-SETUP
-# -----------------------------------------------------------------
-with tabs[1]:
-    st.header("Batteriespeicher-Spezifikation")
-    
-    s = d['speicher']
-    c_s1, c_s2 = st.columns(2)
-    with c_s1:
-        s['h'] = st.text_input("Hersteller", s.get('h', ''))
-        s['kap'] = st.number_input("Nettokapazität (kWh)", 0.0, 10000.0, s['kap'])
-        s['p'] = st.number_input("Max. Ladeleistung (kW)", 0.0, 5000.0, s['p'])
-        s_up = st.file_uploader("Datenblatt Speicher", type=["pdf"])
-        if s_up: s['db'] = upload_handler(s_up, "Speicher")
-    with c_s2:
-        s['zyklen'] = st.number_input("Garantierte Vollzyklen", 0, 15000, s['zyklen'])
-        s['dod'] = st.slider("Entladetiefe (DoD) in %", 10, 100, s['dod'])
-        s['eff'] = st.slider("Wirkungsgrad Roundtrip (%)", 70, 99, s['eff'])
         
-    st.info(f"💡 Bei 280 Zyklen/Jahr beträgt die erwartete Lebensdauer ca. {s['zyklen']/280:.1f} Jahre.")
-
-# -----------------------------------------------------------------
-# TAB 3: MOBILITÄT & FUHRPARK (SUBSTITUTION)
-# -----------------------------------------------------------------
-with tabs[2]:
-    st.header("Flottenmanagement & Diesel-Substitution")
-    
-    col_l, col_f = st.columns([1, 2])
-    
-    with col_l:
-        st.subheader("Ladepunkte")
-        if st.button("➕ Neuer Ladepunkt"):
-            d['mobilität']['lp'].append({"t": "AC", "p": 11, "n": 1})
-        for k, lp in enumerate(d['mobilität']['lp']):
+        # B. FUHRPARK-VERGLEICH (DER DIESEL-RECHNER)
+        st.subheader("2. TCO Fuhrpark-Vergleich (Diesel vs. Elektro)")
+        if st.button("➕ Fahrzeug-Gruppe"):
+            d['mobilität']['fuhrpark'].append({"t": "PKW", "n": 1, "km": 15000, "ec": 18.0, "dc": 6.5})
+            
+        total_ev_kwh = 0
+        for idx, fz in enumerate(d['mobilität']['fuhrpark']):
             with st.container(border=True):
-                lp['t'] = st.selectbox("Typ", ["AC", "DC"], key=f"lpt_{k}")
-                c_lp1, c_lp2 = st.columns(2)
-                lp['p'] = c_lp1.number_input("Leistung (kW)", 1, 400, lp['p'], key=f"lpp_{k}")
-                lp['n'] = c_lp2.number_input("Stück", 1, 100, lp['n'], key=f"lpn_{k}")
-                if st.button("🗑️", key=f"lpdel_{k}"):
-                    d['mobilität']['lp'].pop(k); st.rerun()
-
-    with col_f:
-        st.subheader("Fuhrpark-Rechner")
-        if st.button("➕ Fahrzeuggruppe"):
-            d['mobilität']['fuhrpark'].append({"k": "PKW", "n": 1, "km": 20000, "e_c": 18.0, "d_c": 6.0})
-        
-        for f_idx, fz in enumerate(d['mobilität']['fuhrpark']):
-            with st.container(border=True):
-                cf1, cf2, cf3 = st.columns([2, 1, 1])
-                fz['k'] = cf1.selectbox("Klasse", list(MARKET_DATA["CONSUMPTION"].keys()), key=f"fzk_{f_idx}")
-                fz['n'] = cf2.number_input("Anzahl", 1, 1000, fz['n'], key=f"fzn_{f_idx}")
-                fz['km'] = cf3.number_input("km / Jahr", 1, 500000, fz['km'], key=f"fzm_{f_idx}")
+                cf1, cf2, cf3, cf4, cf5, cf6 = st.columns([1,1,1,1,1,1])
+                fz['t'] = cf1.selectbox("Klasse", ["PKW", "Transporter (N1)", "LKW (N3)"], key=f"fz_t_{idx}")
+                fz['n'] = cf2.number_input("Anzahl", 1, 100, fz['n'], key=f"fz_n_{idx}")
+                fz['km'] = cf3.number_input("km/Jahr", 1000, 200000, fz['km'], key=f"fz_km_{idx}")
+                fz['ec'] = cf4.number_input("kWh/100km", 5.0, 150.0, fz['ec'], key=f"fz_ec_{idx}")
+                fz['dc'] = cf5.number_input("L/100km (Diesel)", 2.0, 50.0, fz['dc'], key=f"fz_dc_{idx}")
                 
-                # KI RECHNER INTEGRATION
-                if st.button(f"🤖 KI-Werte für {fz['k']} laden", key=f"fzki_{f_idx}"):
-                    base = MARKET_DATA["CONSUMPTION"][fz['k']]
-                    fz['e_c'], fz['d_c'] = base['e'], base['d']
-                    st.rerun()
+                # Kalkulation
+                c_diesel = (fz['km']/100) * fz['dc'] * d['wirtschaft']['dieselpreis'] * fz['n']
+                c_elektro = (fz['km']/100) * fz['ec'] * d['wirtschaft']['strompreis'] * fz['n']
+                total_ev_kwh += (fz['km']/100) * fz['ec'] * fz['n']
                 
-                ce1, ce2 = st.columns(2)
-                fz['e_c'] = ce1.number_input("Verbrauch Elektro (kWh/100km)", 0.0, 300.0, fz['e_c'], key=f"fzec_{f_idx}")
-                fz['d_c'] = ce2.number_input("Verbrauch Diesel (L/100km)", 0.0, 100.0, fz['d_c'], key=f"fzdc_{f_idx}")
-                
-                # Interne Live-Kalkulation
-                d_cost = (fz['km']/100 * fz['d_c'] * d['finanzen']['diesel_preis']) + MARKET_DATA["CONSUMPTION"][fz['k']]['service_d'] + MARKET_DATA["CONSUMPTION"][fz['k']]['tax_d']
-                e_cost = (fz['km']/100 * fz['e_c'] * d['finanzen']['strom_preis']) + MARKET_DATA["CONSUMPTION"][fz['k']]['service_e']
-                st.write(f"**TCO Einsparung:** { (d_cost - e_cost) * fz['n'] :,.2f} € / Jahr")
-
-# -----------------------------------------------------------------
-# TAB 4: ERTRAGS-ANALYSE (SIMULATION)
-# -----------------------------------------------------------------
-with tabs[3]:
-    st.header("Standort-Simulation & Arbitrage")
-    c_e1, c_e2 = st.columns(2)
-    
-    with c_e1:
-        region = st.selectbox("Wetter-Region", list(MARKET_DATA["SUN_HOURS"].keys()))
-        sun = MARKET_DATA["SUN_HOURS"][region]
-        st.metric("Spez. Ertrag (Simuliert)", f"{sun} kWh/kWp")
+                cf6.metric("Ersparnis/J", f"{c_diesel - c_elektro:,.0f} €")
+                if cf6.button("🗑️", key=f"fz_del_{idx}"):
+                    d['mobilität']['fuhrpark'].pop(idx); st.rerun()
         
-        # PV-Gen Berechnung
-        total_kwp = sum([(f['wp'] * f['n']) / 1000 for f in d['pv']['felder']])
-        raw_yield = total_kwp * sun * (1 - (d['pv']['kabel_verlust']/100))
-        st.write(f"Voraussichtlicher Jahresertrag: **{raw_yield:,.0f} kWh**")
+        d['mobilität']['total_ev_kwh'] = total_ev_kwh
 
-    with c_e2:
-        st.subheader("Börsenhandel (Arbitrage)")
-        arb_on = st.toggle("Arbitrage-Modus (EPEX Spot)", False)
-        spread = st.slider("Ø Preis-Spread (ct/kWh)", 5.0, 40.0, 12.0)
-        potential = (d['speicher']['kap'] * 280 * (spread/100)) if arb_on else 0
-        st.metric("Arbitrage-Potenzial", f"{potential:,.2f} € / Jahr")
+    t_idx += 1
 
 # -----------------------------------------------------------------
-# TAB 5: ROI & TCO (DIE RECHNUNG)
+# TAB: KI-ANALYSE & ROI
 # -----------------------------------------------------------------
-with tabs[4]:
-    st.header("Wirtschaftlichkeit (Enterprise Reporting)")
+with tabs[t_idx]:
+    st.header("📊 Wirtschaftlichkeit & Simulation")
     
-    invest = st.number_input("Gesamtinvestition Netto (€)", 0.0, 10000000.0, d['finanzen']['invest'])
-    d['finanzen']['invest'] = invest
-    
-    # 20-Jahre Cashflow Simulation
-    cf_list = []
-    for y in range(20):
-        # Degradierten Ertrag rechnen
-        y_yield = raw_yield * ((1 - (d['pv']['degradation']/100))**y)
-        # Einsparung aus Fuhrpark
-        f_save = 0
-        for fz in d['mobilität']['fuhrpark']:
-            d_tco = (fz['km']/100 * fz['d_c'] * d['finanzen']['diesel_preis']) + MARKET_DATA["CONSUMPTION"][fz['k']]['service_d'] + MARKET_DATA["CONSUMPTION"][fz['k']]['tax_d']
-            e_tco = (fz['km']/100 * fz['e_c'] * d['finanzen']['strom_preis']) + MARKET_DATA["CONSUMPTION"][fz['k']]['service_e']
-            f_save += (d_tco - e_tco) * fz['n']
-        
-        # THG Quoten
-        thg_save = sum([MARKET_DATA["THG_2026"].get(fz['k'], 0) * fz['n'] for fz in d['mobilität']['fuhrpark']])
-        
-        yearly_cf = f_save + thg_save + potential + (y_yield * 0.08) - (invest * (d['finanzen']['wartung_pa']/100))
-        cf_list.append(yearly_cf)
-    
-    # KPIs
-    st.divider()
-    res1, res2, res3 = st.columns(3)
-    
-    lcoe = calc_lcoe(invest, raw_yield)
-    res1.metric("LCOE (Stromkosten)", f"{lcoe:.4f} €/kWh")
-    
-    npv_val = calc_npv(invest, cf_list, rate=d['finanzen']['zins_satz'])
-    res2.metric("Net Present Value (NPV)", f"{npv_val:,.2f} €", delta="Positiv" if npv_val > 0 else "Negativ")
-    
-    if sum(cf_list) > 0:
-        payback = invest / (sum(cf_list)/20)
-        res3.metric("Amortisation (Statisch)", f"{payback:.1f} Jahre")
+    with st.expander("Globale Parameter"):
+        cp1, cp2, cp3 = st.columns(3)
+        d['wirtschaft']['strompreis'] = cp1.number_input("Strompreis Netz (€/kWh)", 0.10, 0.80, d['wirtschaft']['strompreis'])
+        d['wirtschaft']['last_jahr'] = cp2.number_input("Gebäudeverbrauch (kWh/a)", 500, 1000000, d['wirtschaft']['last_jahr'])
+        region = cp3.selectbox("Region", ["Nord", "Mitte", "Süd"])
 
-    st.subheader("Kumulierter Cashflow (20 Jahre)")
-    st.line_chart(np.cumsum([-invest] + cf_list))
+    if d['pv']['total_kwp'] > 0:
+        # SIMULATION
+        sim_data = run_simulation(
+            d['pv']['total_kwp'], 
+            d['wirtschaft']['last_jahr'], 
+            d['speicher']['kap'], 
+            d.get('mobilität', {}).get('total_ev_kwh', 0),
+            region
+        )
+        
+        st.subheader("Jahresverlauf 2026 (Synthetisches Profil)")
+        st.line_chart(sim_data[["PV", "Last", "Eigen"]])
+        
+        # KPI BOXEN
+        k1, k2, k3, k4 = st.columns(4)
+        total_p = sim_data["PV"].sum()
+        total_e = sim_data["Eigen"].sum()
+        autarkie = (total_e / sim_data["Last"].sum()) * 100
+        
+        k1.metric("PV-Ertrag", f"{total_p:,.0f} kWh")
+        k2.metric("Eigenverbrauch", f"{total_e:,.0f} kWh")
+        k3.metric("Autarkie", f"{autarkie:.1f} %")
+        k4.metric("E-Mobilität Last", f"{d.get('mobilität', {}).get('total_ev_kwh', 0):,.0f} kWh")
+        
+        # KI OPTIMIERER
+        st.subheader("🤖 KI-Berater")
+        recs = []
+        if autarkie < 35 and d['speicher']['kap'] == 0:
+            recs.append("Der Autarkiegrad ist kritisch niedrig. Ein Speicher von mind. 10 kWh würde die Stromkosten um ca. 40% senken.")
+        if d['pv']['total_kwp'] < (d['wirtschaft']['last_jahr'] / 1000):
+            recs.append("Die PV-Anlage ist im Verhältnis zum Verbrauch klein dimensioniert. Dachflächen-Maximierung prüfen.")
+        
+        for r in recs: st.info(r)
+
+    else:
+        st.warning("Bitte erst PV-Konfiguration vornehmen.")
 
 # FINALER SAVE
-st.divider()
-if st.button("💾 PROJEKT-DATEN FINALISIEREN", use_container_width=True, type="primary"):
-    save_state()
-    st.balloons()
+save()
