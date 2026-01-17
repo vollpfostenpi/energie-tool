@@ -53,24 +53,39 @@ WB_POWER_OPTIONS = [11, 22, 50, 150]
 FZ_KLASSEN = ["PKW", "Transporter", "LKW"]
 SIM_RES_OPTIONS = ["15min", "hour"]
 
-# kWh/kWp/a heuristisch (nur für PV-Synthese, da Lastgang real)
-REGIONS = {"Nord": 940, "Mitte": 1060, "Süd": 1180}
-
+REGIONS = {"Nord": 940, "Mitte": 1060, "Süd": 1180}  # kWh/kWp/a (heuristisch)
 OBJECTIVES = [
     "Eigenverbrauch/Autarkie",
     "Depotcharging/Lastmanagement",
     "Arbitrage (Stromhandel)",
     "Kombi (Eigenverbrauch + Arbitrage)",
 ]
+HAK_MODE_OPTIONS = ["Ampere", "kW"]
 
 
 # ================================================================
 # 2) DEFAULTS / MIGRATION
 # ================================================================
+def _hak_kw_from_ampere(a: float) -> float:
+    return (float(a) * 400.0 * 1.73) / 1000.0
+
+
+def _hak_ampere_from_kw(kw: float) -> int:
+    # Rückrechnung grob
+    a = float(kw) * 1000.0 / (400.0 * 1.73)
+    return int(max(round(a), 1))
+
+
 DEFAULTS = {
     "kunde": {"name": "—"},
     "scope": ["PV-System", "Speicher", "Ladeinfrastruktur"],
-    "tech": {"hak_ampere": 63, "ems_required": False, "berechnungs_modus": "Detail"},
+    "tech": {
+        "hak_mode": "Ampere",   # NEU: Ampere oder kW
+        "hak_ampere": 63,
+        "hak_kw": round(_hak_kw_from_ampere(63), 1),  # NEU
+        "ems_required": False,
+        "berechnungs_modus": "Detail",
+    },
     # Alt (für Rückwärtskompatibilität)
     "dach": {"form": "Satteldach", "breite": 10.0, "tiefe": 6.0, "flaeche": 60.0, "neigung": 35, "azimut": 0},
     # Neu: mehrere Dächer
@@ -93,8 +108,10 @@ DEFAULTS = {
         }
     ],
     "pv": {
-        "felder": [],   # pro Feld: roof_id, hersteller, typ, watt_pro_modul, anzahl_module, datasheet
-        "wr": [],       # pro WR: modell, ac_kw, datasheet
+        # pro Feld: roof_id, hersteller, typ, watt_pro_modul, anzahl_module, datasheet
+        "felder": [],
+        # pro WR: modell, ac_kw, datasheet
+        "wr": [],
         "konzept": "Überschusseinspeisung",
         "total_kwp": 0.0,
         "total_ac_kw": 0.0,
@@ -106,6 +123,12 @@ DEFAULTS = {
         "spannung": "Hochvolt",
         "datasheet": "",
         "objective": "Eigenverbrauch/Autarkie",
+        # neue Felder
+        "min_soc_pct": 10.0,
+        "cycle_life": 6000,
+        "calendar_life_years": 15,
+        "warranty_years": 10,
+        "eta_roundtrip": 0.92,
         "arbitrage": {
             "enabled": False,
             "mode": "Manuell",  # Manuell | Auto
@@ -118,7 +141,7 @@ DEFAULTS = {
             "dod": 0.90,
             "degradation_eur_per_kwh_throughput": 0.03,
             # Auto-Fetch Settings
-            "source": "SMARD (DE/LU)",     # SMARD | ENTSO | CSV
+            "source": "SMARD (DE/LU)",
             "smard_series_id": 8004169,
             "smard_region": "DE-LU",
             "lookback_days": 30,
@@ -131,6 +154,10 @@ DEFAULTS = {
             "price_csv_unit": "EUR/kWh",
             "continuous_soc": True,
             "soc_grid_points": 201,
+            # NEU: Terminal / Rolling Horizon
+            "terminal_mode": "End-SOC = SOC_min",            # oder "End-SOC frei (kein Restwert)" / "End-SOC frei (mit Restwert)"
+            "terminal_value_mode": "Auto (letzter Preis)",   # oder "Manuell"
+            "terminal_value_eur_per_kwh": 0.25,              # nur bei Manuell
             # Cached results
             "prices_cached": False,
             "prices_last_fetch": "",
@@ -150,11 +177,12 @@ DEFAULTS = {
         "dieselpreis": 1.70,
         "einspeise_v": 0.08,
         "lastgang_jahr": 5000,
-        # Lastgang Import
+        # Lastgang Import (wird hier NICHT per UI abgefragt; nur gelesen, falls vorhanden)
         "lastgang_file": "",
         "lastgang_datetime_col": "",
         "lastgang_value_col": "",
-        "lastgang_timezone": "Europe/Berlin",
+        "lastgang_sep": ";",
+        "lastgang_decimal": ",",
         "lastgang_resolution": "15min",
         "lastgang_is_power_kw": True,
         # CAPEX/OPEX
@@ -212,8 +240,11 @@ def safe_index(options, value, fallback=0) -> int:
         return fallback
 
 
-def hak_p_max_kw(hak_ampere: int) -> float:
-    return (hak_ampere * 400 * 1.73) / 1000
+def hak_p_max_kw_from_state(d: dict) -> float:
+    mode = str(d.get("tech", {}).get("hak_mode", "Ampere"))
+    if mode == "kW":
+        return float(d.get("tech", {}).get("hak_kw", _hak_kw_from_ampere(d["tech"].get("hak_ampere", 63))) or 0.0)
+    return _hak_kw_from_ampere(float(d.get("tech", {}).get("hak_ampere", 63) or 63))
 
 
 def ensure_roof_ids(d: dict):
@@ -223,6 +254,13 @@ def ensure_roof_ids(d: dict):
 
 
 def migrate_legacy(d: dict):
+    # Tech (hak_mode / hak_kw)
+    d.setdefault("tech", {})
+    deep_merge(d["tech"], DEFAULTS["tech"])
+    # wenn hak_kw leer -> aus Ampere ableiten
+    if not d["tech"].get("hak_kw"):
+        d["tech"]["hak_kw"] = round(_hak_kw_from_ampere(float(d["tech"].get("hak_ampere", 63))), 1)
+
     # Dächer
     if "daecher" not in d or not isinstance(d["daecher"], list) or len(d["daecher"]) == 0:
         old = d.get("dach", {})
@@ -244,10 +282,17 @@ def migrate_legacy(d: dict):
         }]
     ensure_roof_ids(d)
 
+    # PV container
+    d.setdefault("pv", {})
+    deep_merge(d["pv"], DEFAULTS["pv"])
+
     # WR Migration: alt {"h","p"} -> neu {"modell","ac_kw"}
     wr_new = []
     for w in d.get("pv", {}).get("wr", []):
         if isinstance(w, dict) and ("ac_kw" in w or "modell" in w):
+            w.setdefault("modell", w.get("h", ""))
+            w.setdefault("ac_kw", float(w.get("p", 0.0) or 0.0))
+            w.setdefault("datasheet", w.get("datasheet", ""))
             wr_new.append(w)
         elif isinstance(w, dict):
             wr_new.append({
@@ -255,8 +300,7 @@ def migrate_legacy(d: dict):
                 "ac_kw": float(w.get("p", 0.0) or 0.0),
                 "datasheet": w.get("datasheet", ""),
             })
-    if wr_new:
-        d["pv"]["wr"] = wr_new
+    d["pv"]["wr"] = wr_new
 
     # PV-Felder Migration: alt {"h","t","w","n"} -> neu
     fields_new = []
@@ -264,9 +308,12 @@ def migrate_legacy(d: dict):
         if not isinstance(f, dict):
             continue
         if "watt_pro_modul" in f:
-            # ensure roof_id
             if not f.get("roof_id") and d.get("daecher"):
                 f["roof_id"] = d["daecher"][0]["id"]
+            f.setdefault("hersteller", f.get("h", ""))
+            f.setdefault("typ", f.get("t", ""))
+            f.setdefault("anzahl_module", int(f.get("n", 0) or 0))
+            f.setdefault("datasheet", f.get("datasheet", ""))
             fields_new.append(f)
         else:
             rid = d["daecher"][0]["id"]
@@ -279,6 +326,14 @@ def migrate_legacy(d: dict):
                 "datasheet": f.get("datasheet", ""),
             })
     d["pv"]["felder"] = fields_new
+
+    # Speicher + Wirtschaft + Mobilität deep merge
+    d.setdefault("speicher", {})
+    deep_merge(d["speicher"], DEFAULTS["speicher"])
+    d.setdefault("wirtschaft", {})
+    deep_merge(d["wirtschaft"], DEFAULTS["wirtschaft"])
+    d.setdefault("mobilität", {})
+    deep_merge(d["mobilität"], DEFAULTS["mobilität"])
 
 
 def load_project(slug: str) -> tuple[dict, Path]:
@@ -394,31 +449,66 @@ def wr_ac_total(d: dict) -> float:
 
 
 # ================================================================
-# 5) LASTGANG IMPORT / PARSE
+# 5) LASTGANG READ (OHNE UI) – nutzt Daten aus state.json
 # ================================================================
 @st.cache_data(show_spinner=False)
-def parse_lastgang_csv(content: bytes, sep: str, decimal: str) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(content), sep=sep, decimal=decimal)
-    return df
+def _read_csv_bytes(content: bytes, sep: str, decimal: str) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(content), sep=sep, decimal=decimal)
 
 
-def ensure_datetime_index(df: pd.DataFrame, dt_col: str) -> pd.DataFrame:
+def _ensure_datetime_index(df: pd.DataFrame, dt_col: str) -> pd.DataFrame:
     out = df.copy()
     out[dt_col] = pd.to_datetime(out[dt_col], errors="coerce", utc=False)
-    out = out.dropna(subset=[dt_col])
-    out = out.sort_values(dt_col)
-    out = out.set_index(dt_col)
+    out = out.dropna(subset=[dt_col]).sort_values(dt_col).set_index(dt_col)
     return out
 
 
-def resample_series(s: pd.Series, resolution: str) -> pd.Series:
+def _resample_series(s: pd.Series, resolution: str) -> pd.Series:
     if resolution == "15min":
         return s.resample("15T").mean().interpolate(limit_direction="both")
     return s.resample("H").mean().interpolate(limit_direction="both")
 
 
+def load_lastgang_from_state(d: dict) -> pd.Series | None:
+    w = d.get("wirtschaft", {})
+    f = str(w.get("lastgang_file", "") or "").strip()
+    dt_col = str(w.get("lastgang_datetime_col", "") or "").strip()
+    val_col = str(w.get("lastgang_value_col", "") or "").strip()
+    if not f or not dt_col or not val_col:
+        return None
+    p = Path(f)
+    if not p.exists():
+        return None
+
+    sep = str(w.get("lastgang_sep", ";") or ";")
+    dec = str(w.get("lastgang_decimal", ",") or ",")
+    resolution = str(w.get("lastgang_resolution", "15min") or "15min")
+    is_kw = bool(w.get("lastgang_is_power_kw", True))
+
+    try:
+        content = p.read_bytes()
+        df = _read_csv_bytes(content, sep=sep, decimal=dec)
+        if dt_col not in df.columns or val_col not in df.columns:
+            return None
+        df2 = _ensure_datetime_index(df, dt_col)
+        s = pd.to_numeric(df2[val_col], errors="coerce").fillna(0.0)
+        s = _resample_series(s, resolution)
+
+        # kW -> kWh/step
+        if len(s.index) > 1:
+            dt_h = (s.index[1] - s.index[0]).total_seconds() / 3600.0
+        else:
+            dt_h = 1.0
+        if is_kw:
+            s = s * dt_h
+
+        return s
+    except Exception:
+        return None
+
+
 # ================================================================
-# 6) SIMULATION (Lastgang real + PV synthetisch skaliert)
+# 6) SIMULATION (Lastgang real, PV synthetisch)
 # ================================================================
 def build_synth_pv_profile(index: pd.DatetimeIndex, pv_kwp: float, region: str, seed: int) -> pd.Series:
     rng = np.random.default_rng(seed)
@@ -460,16 +550,46 @@ def build_ev_profile(index: pd.DatetimeIndex, ev_kwh_year: float, seed: int) -> 
     return pd.Series(index=index, data=ev)
 
 
-def simulate_timeseries(pv_kwh: pd.Series, load_kwh: pd.Series, bat_kwh: float, bat_kw: float, roundtrip_eff: float = 0.92) -> pd.DataFrame:
+def build_synth_load(index: pd.DatetimeIndex, annual_kwh: float, seed: int) -> pd.Series:
+    """Fallback, wenn kein Lastgang vorhanden: synthetisches Lastprofil in kWh/step."""
+    rng = np.random.default_rng(seed + 777)
+    n = len(index)
+    if n == 0:
+        return pd.Series(index=index, data=np.zeros(0))
+    annual_kwh = max(float(annual_kwh), 0.0)
+
+    doy = index.dayofyear.values
+    year_frac = doy / 365.0
+    seasonal = 1.0 + 0.15 * np.cos(2 * np.pi * year_frac)
+
+    hour = index.hour.values + index.minute.values / 60.0
+    daily = 0.9 + 0.35 * np.cos(2 * np.pi * (hour - 18) / 24)
+    noise = np.clip(rng.normal(1.0, 0.08, n), 0.7, 1.3)
+
+    raw = seasonal * daily * noise
+    raw_sum = raw.sum()
+    kwh_step = (raw / raw_sum) * annual_kwh if raw_sum > 0 else np.zeros(n)
+    return pd.Series(index=index, data=kwh_step)
+
+
+def simulate_timeseries(
+    pv_kwh: pd.Series,
+    load_kwh: pd.Series,
+    bat_kwh: float,
+    bat_kw: float,
+    roundtrip_eff: float,
+    min_soc_pct: float,
+) -> pd.DataFrame:
     idx = load_kwh.index
     pv_kwh = pv_kwh.reindex(idx).fillna(0.0)
-    load_kwh = load_kwh.fillna(0.0)
+    load_kwh = load_kwh.reindex(idx).fillna(0.0)
 
     dt_h = (idx[1] - idx[0]).total_seconds() / 3600.0 if len(idx) > 1 else 1.0
     pmax_kwh_step = max(bat_kw, 0.0) * dt_h
 
     cap = max(bat_kwh, 0.0)
-    soc = 0.0
+    reserve = cap * (float(min_soc_pct) / 100.0) if cap > 0 else 0.0
+    soc = reserve
 
     eff = float(np.clip(roundtrip_eff, 0.5, 0.99))
     eff_c = np.sqrt(eff)
@@ -491,10 +611,11 @@ def simulate_timeseries(pv_kwh: pd.Series, load_kwh: pd.Series, bat_kwh: float, 
             surplus -= ch
 
         dis_delivered = 0.0
-        if cap > 0 and pmax_kwh_step > 0 and deficit > 0 and soc > 0:
+        if cap > 0 and pmax_kwh_step > 0 and deficit > 0 and soc > reserve:
             dis_possible = min(deficit, pmax_kwh_step)
             need_from_soc = dis_possible / eff_d
-            take = min(need_from_soc, soc)
+            available = max(soc - reserve, 0.0)
+            take = min(need_from_soc, available)
             dis_delivered = take * eff_d
             soc -= take
             deficit -= dis_delivered
@@ -524,18 +645,15 @@ def simulate_timeseries(pv_kwh: pd.Series, load_kwh: pd.Series, bat_kwh: float, 
 
 
 # ================================================================
-# 7) ARBITRAGE: FETCH + OPTIMIERUNG (täglich / kontinuierlich)
+# 7) ARBITRAGE: FETCH + OPTIMIERUNG (kontinuierlich + Terminal-Option)
 # ================================================================
 def _to_hourly_prices(prices: pd.Series) -> pd.Series:
-    s = prices.copy()
-    s = s.dropna()
+    s = prices.copy().dropna()
     if s.empty:
         return s
     if not isinstance(s.index, pd.DatetimeIndex):
         raise ValueError("Preisserie hat keinen DatetimeIndex.")
-    s = s.sort_index()
-    s = s.resample("H").mean()
-    s = s.interpolate(limit_direction="both")
+    s = s.sort_index().resample("H").mean().interpolate(limit_direction="both")
     return s
 
 
@@ -591,8 +709,7 @@ def fetch_smard_day_ahead_prices(series_id: int, region: str, resolution: str = 
             t, v = p[0], p[1]
             if t >= from_ms:
                 ts.append(pd.to_datetime(int(t), unit="ms", utc=True).tz_convert("Europe/Berlin"))
-                # SMARD: EUR/MWh -> EUR/kWh
-                vals.append(float(v) / 1000.0)
+                vals.append(float(v) / 1000.0)  # EUR/MWh -> EUR/kWh
         except Exception:
             pass
 
@@ -617,8 +734,7 @@ def fetch_entsoe_day_ahead_prices(token: str, bidding_zone: str, start: datetime
     if hasattr(s.index, "tz") and s.index.tz is not None:
         s = s.tz_convert("Europe/Berlin")
 
-    # EUR/MWh -> EUR/kWh
-    s = (s.astype(float) / 1000.0)
+    s = (s.astype(float) / 1000.0)  # EUR/MWh -> EUR/kWh
     return _to_hourly_prices(s.sort_index())
 
 
@@ -626,8 +742,7 @@ def fetch_entsoe_day_ahead_prices(token: str, bidding_zone: str, start: datetime
 def parse_price_csv(content: bytes, sep: str, decimal: str, dt_col: str, price_col: str) -> pd.Series:
     df = pd.read_csv(io.BytesIO(content), sep=sep, decimal=decimal)
     df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
-    df = df.dropna(subset=[dt_col])
-    df = df.sort_values(dt_col).set_index(dt_col)
+    df = df.dropna(subset=[dt_col]).sort_values(dt_col).set_index(dt_col)
     s = pd.to_numeric(df[price_col], errors="coerce").dropna()
     return _to_hourly_prices(s)
 
@@ -659,210 +774,6 @@ def arbitrage_profit_manual_rough(arbd: dict, bat_kwh: float) -> float:
     return float(profit)
 
 
-def _dp_optimize_one_day(
-    prices_eur_per_kwh: np.ndarray,
-    cap_kwh: float,
-    p_kw: float,
-    dod: float,
-    roundtrip_eff: float,
-    deg_cost_per_kwh_throughput: float,
-    soc_grid_points: int = 201,
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    DP je Tag (24h), Start=End=soc_min (Tages-Reset).
-    """
-    T = len(prices_eur_per_kwh)
-    if T == 0:
-        return 0.0, np.array([]), np.array([]), np.array([])
-    if cap_kwh <= 0 or p_kw <= 0:
-        soc = np.zeros(T + 1, dtype=float)
-        return 0.0, soc, np.zeros(T), np.zeros(T)
-
-    dod = float(np.clip(dod, 0.10, 1.0))
-    eff = float(np.clip(roundtrip_eff, 0.50, 0.99))
-    eff_c = np.sqrt(eff)
-    eff_d = np.sqrt(eff)
-
-    soc_max = float(cap_kwh)
-    soc_min = float(cap_kwh * (1.0 - dod))
-
-    p_limit_grid_kwh = float(p_kw)  # kWh/h
-    max_soc_increase = p_limit_grid_kwh * eff_c
-    max_soc_decrease = (p_limit_grid_kwh / eff_d) if eff_d > 0 else 0.0
-
-    N = max(int(soc_grid_points), 51)
-    levels = np.linspace(soc_min, soc_max, N)
-
-    neg_inf = -1e30
-    v_next = np.full(N, neg_inf, dtype=float)
-    v_next[0] = 0.0
-
-    best_next = np.full((T, N), -1, dtype=np.int16)
-
-    for t in range(T - 1, -1, -1):
-        price = float(prices_eur_per_kwh[t])
-        v_cur = np.full(N, neg_inf, dtype=float)
-
-        for i in range(N):
-            soc_i = levels[i]
-            low_soc = max(soc_min, soc_i - max_soc_decrease)
-            high_soc = min(soc_max, soc_i + max_soc_increase)
-
-            j_lo = int(np.searchsorted(levels, low_soc, side="left"))
-            j_hi = int(np.searchsorted(levels, high_soc, side="right")) - 1
-            if j_hi < j_lo:
-                continue
-
-            best_val = neg_inf
-            best_j = -1
-
-            for j in range(j_lo, j_hi + 1):
-                soc_j = levels[j]
-                delta_soc = soc_j - soc_i
-
-                if delta_soc > 1e-12:
-                    grid_charge = delta_soc / eff_c if eff_c > 0 else 0.0
-                    if grid_charge - p_limit_grid_kwh > 1e-9:
-                        continue
-                    revenue = 0.0
-                    cost = grid_charge * price
-                    throughput = abs(delta_soc)
-                elif delta_soc < -1e-12:
-                    soc_out = -delta_soc
-                    grid_discharge = soc_out * eff_d
-                    if grid_discharge - p_limit_grid_kwh > 1e-9:
-                        continue
-                    revenue = grid_discharge * price
-                    cost = 0.0
-                    throughput = abs(delta_soc)
-                else:
-                    revenue = cost = throughput = 0.0
-
-                immediate = revenue - cost - deg_cost_per_kwh_throughput * throughput
-                val = immediate + float(v_next[j])
-
-                if val > best_val:
-                    best_val = val
-                    best_j = j
-
-            v_cur[i] = best_val
-            best_next[t, i] = best_j
-
-        v_next = v_cur
-
-    soc = np.zeros(T + 1, dtype=float)
-    grid_ch = np.zeros(T, dtype=float)
-    grid_dis = np.zeros(T, dtype=float)
-    idx_soc = 0
-    soc[0] = levels[idx_soc]
-    profit = 0.0
-
-    for t in range(T):
-        j = int(best_next[t, idx_soc])
-        if j < 0:
-            j = idx_soc
-
-        soc_i = levels[idx_soc]
-        soc_j = levels[j]
-        delta_soc = soc_j - soc_i
-        price = float(prices_eur_per_kwh[t])
-
-        if delta_soc > 1e-12:
-            grid_charge = delta_soc / eff_c if eff_c > 0 else 0.0
-            grid_ch[t] = grid_charge
-            profit += -(grid_charge * price) - deg_cost_per_kwh_throughput * delta_soc
-        elif delta_soc < -1e-12:
-            soc_out = -delta_soc
-            grid_discharge = soc_out * eff_d
-            grid_dis[t] = grid_discharge
-            profit += (grid_discharge * price) - deg_cost_per_kwh_throughput * soc_out
-
-        soc[t + 1] = soc_j
-        idx_soc = j
-
-    return float(profit), soc, grid_ch, grid_dis
-
-
-def optimize_arbitrage_from_prices(
-    prices_hourly_eur_per_kwh: pd.Series,
-    cap_kwh: float,
-    p_kw: float,
-    dod: float,
-    roundtrip_eff: float,
-    deg_cost_per_kwh_throughput: float,
-    soc_grid_points: int = 201,
-) -> dict:
-    """
-    Tagesweise Optimierung (Reset). Annualisiert über durchschnittlichen Tag.
-    """
-    ser = _to_hourly_prices(prices_hourly_eur_per_kwh)
-    if ser.empty:
-        return {"profit_year": 0.0, "throughput_year": 0.0, "cycles_year": 0.0, "schedule_df": pd.DataFrame(), "days_used": 0}
-
-    df = ser.to_frame("price").copy()
-    df["date"] = df.index.date
-
-    counts = df.groupby("date")["price"].count()
-    full_days = set(counts[counts >= 24].index.tolist())
-
-    total_profit = 0.0
-    total_throughput = 0.0
-    used_days = 0
-    schedule_df = pd.DataFrame()
-
-    for day in sorted(full_days):
-        day_df = df[df["date"] == day].iloc[:24]
-        prices = day_df["price"].astype(float).values
-
-        profit_day, soc, grid_ch, grid_dis = _dp_optimize_one_day(
-            prices,
-            cap_kwh=cap_kwh,
-            p_kw=p_kw,
-            dod=dod,
-            roundtrip_eff=roundtrip_eff,
-            deg_cost_per_kwh_throughput=deg_cost_per_kwh_throughput,
-            soc_grid_points=soc_grid_points,
-        )
-
-        deltas = np.diff(soc)
-        throughput_day = float(np.sum(np.abs(deltas)))
-
-        total_profit += float(profit_day)
-        total_throughput += throughput_day
-        used_days += 1
-
-        # store last day schedule (for export/preview)
-        if day == sorted(full_days)[-1]:
-            schedule_df = pd.DataFrame({
-                "timestamp": day_df.index,
-                "price_eur_per_kwh": prices,
-                "soc_kwh": soc[:-1],
-                "soc_next_kwh": soc[1:],
-                "grid_charge_kwh": grid_ch,
-                "grid_discharge_kwh": grid_dis,
-            }).set_index("timestamp")
-
-    if used_days == 0:
-        return {"profit_year": 0.0, "throughput_year": 0.0, "cycles_year": 0.0, "schedule_df": pd.DataFrame(), "days_used": 0}
-
-    mean_daily_profit = total_profit / used_days
-    mean_daily_throughput = total_throughput / used_days
-
-    profit_year = mean_daily_profit * 365.0
-    throughput_year = mean_daily_throughput * 365.0
-
-    usable = max(cap_kwh * float(np.clip(dod, 0.10, 1.0)), 1e-9)
-    cycles_year = throughput_year / (2.0 * usable)
-
-    return {
-        "profit_year": float(profit_year),
-        "throughput_year": float(throughput_year),
-        "cycles_year": float(cycles_year),
-        "schedule_df": schedule_df,
-        "days_used": int(used_days),
-    }
-
-
 def _dp_optimize_horizon(
     prices_eur_per_kwh: np.ndarray,
     cap_kwh: float,
@@ -870,11 +781,16 @@ def _dp_optimize_horizon(
     dod: float,
     roundtrip_eff: float,
     deg_cost_per_kwh_throughput: float,
-    soc_grid_points: int = 201,
+    soc_grid_points: int,
+    terminal_mode: str,
+    terminal_value_eur_per_kwh: float,
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Globales DP über gesamten Horizont (SOC wird über Tage mitgenommen).
-    Start=End=soc_min.
+    Globales DP über gesamten Horizont (SOC carry-over).
+    Terminal-Optionen:
+      - "End-SOC = SOC_min"               => Endzustand fix soc_min
+      - "End-SOC frei (kein Restwert)"    => Endzustand frei, kein Wert
+      - "End-SOC frei (mit Restwert)"     => Endzustand frei, Restwert für SOC über SOC_min
     """
     T = len(prices_eur_per_kwh)
     if T == 0:
@@ -899,8 +815,18 @@ def _dp_optimize_horizon(
     levels = np.linspace(soc_min, soc_max, N)
 
     neg_inf = -1e30
-    v_next = np.full(N, neg_inf, dtype=float)
-    v_next[0] = 0.0  # End-SOC muss soc_min sein
+
+    # Terminal condition/value
+    if terminal_mode == "End-SOC = SOC_min":
+        v_next = np.full(N, neg_inf, dtype=float)
+        v_next[0] = 0.0
+    elif terminal_mode == "End-SOC frei (mit Restwert)":
+        tv = max(float(terminal_value_eur_per_kwh), 0.0)
+        # Restwert nur über SOC_min (vermeidbare Reserve nicht "bewerten")
+        salvage = np.maximum(levels - soc_min, 0.0) * tv * eff_d
+        v_next = salvage.astype(float)
+    else:  # "End-SOC frei (kein Restwert)"
+        v_next = np.zeros(N, dtype=float)
 
     best_next = np.full((T, N), -1, dtype=np.int16)
 
@@ -955,9 +881,11 @@ def _dp_optimize_horizon(
 
         v_next = v_cur
 
+    # Start-SOC: soc_min (konservativ). Du kannst später optional "start_soc_pct" ergänzen.
     soc = np.zeros(T + 1, dtype=float)
     grid_ch = np.zeros(T, dtype=float)
     grid_dis = np.zeros(T, dtype=float)
+
     idx_soc = 0
     soc[0] = levels[idx_soc]
     profit = 0.0
@@ -985,6 +913,7 @@ def _dp_optimize_horizon(
         soc[t + 1] = soc_j
         idx_soc = j
 
+    # Falls Terminal "mit Restwert": DP hat den Restwert schon eingerechnet.
     return float(profit), soc, grid_ch, grid_dis
 
 
@@ -995,12 +924,10 @@ def optimize_arbitrage_continuous(
     dod: float,
     roundtrip_eff: float,
     deg_cost_per_kwh_throughput: float,
-    soc_grid_points: int = 201,
+    soc_grid_points: int,
+    terminal_mode: str,
+    terminal_value_eur_per_kwh: float,
 ) -> dict:
-    """
-    Kontinuierliche Optimierung über gesamten Preishorizont (SOC carry-over).
-    Annualisiert über Profit/Tag.
-    """
     ser = _to_hourly_prices(prices_hourly_eur_per_kwh).dropna()
     if ser.empty:
         return {"profit_year": 0.0, "throughput_year": 0.0, "cycles_year": 0.0, "schedule_df": pd.DataFrame(), "days_used": 0}
@@ -1014,6 +941,8 @@ def optimize_arbitrage_continuous(
         roundtrip_eff=roundtrip_eff,
         deg_cost_per_kwh_throughput=deg_cost_per_kwh_throughput,
         soc_grid_points=soc_grid_points,
+        terminal_mode=terminal_mode,
+        terminal_value_eur_per_kwh=terminal_value_eur_per_kwh,
     )
 
     deltas = np.diff(soc)
@@ -1049,7 +978,7 @@ def optimize_arbitrage_continuous(
 # ================================================================
 # 8) KI-SPEICHEREMPFEHLUNG (praxisnah)
 # ================================================================
-def recommend_storage(d: dict, hak_kw: float, objective: str, region: str) -> dict:
+def recommend_storage(d: dict, hak_kw: float, objective: str) -> dict:
     pvkwp = float(d["pv"].get("total_kwp", 0.0))
     pvac = float(d["pv"].get("total_ac_kw", 0.0))
     load_building = float(d["wirtschaft"].get("lastgang_jahr", 0.0))
@@ -1116,51 +1045,43 @@ def recommend_storage(d: dict, hak_kw: float, objective: str, region: str) -> di
 
 
 # ================================================================
-# 9) REPORT / PACKAGE EXPORT
+# 9) REPORT / PACKAGE EXPORT (+ index.html im ZIP)
 # ================================================================
 def collect_attachments(d: dict) -> list[dict]:
     items = []
 
-    # Lastgang
-    lg = d.get("wirtschaft", {}).get("lastgang_file", "")
+    w = d.get("wirtschaft", {})
+    lg = str(w.get("lastgang_file", "") or "")
     if lg:
         items.append({"type": "Input", "name": "Lastgang CSV", "path": lg})
 
-    # Price CSV (Arbitrage)
     arb = d.get("speicher", {}).get("arbitrage", {})
     if arb.get("price_csv_file"):
         items.append({"type": "Arbitrage", "name": "Preis-CSV", "path": arb["price_csv_file"]})
-
-    # Arbitrage schedule
     if arb.get("schedule_file"):
         items.append({"type": "Arbitrage", "name": "Schedule CSV", "path": arb["schedule_file"]})
 
-    # PV Module datasheets
     for i, f in enumerate(d.get("pv", {}).get("felder", []), start=1):
-        p = f.get("datasheet", "")
+        p = str(f.get("datasheet", "") or "")
         if p:
             items.append({"type": "PV Modul", "name": f"Feld {i}: {f.get('typ','')}", "path": p})
 
-    # WR datasheets
-    for i, w in enumerate(d.get("pv", {}).get("wr", []), start=1):
-        p = w.get("datasheet", "")
+    for i, wri in enumerate(d.get("pv", {}).get("wr", []), start=1):
+        p = str(wri.get("datasheet", "") or "")
         if p:
-            items.append({"type": "Wechselrichter", "name": f"WR {i}: {w.get('modell','')}", "path": p})
+            items.append({"type": "Wechselrichter", "name": f"WR {i}: {wri.get('modell','')}", "path": p})
 
-    # Speicher datasheet
-    sp = d.get("speicher", {}).get("datasheet", "")
+    sp = str(d.get("speicher", {}).get("datasheet", "") or "")
     if sp:
         items.append({"type": "Speicher", "name": d.get("speicher", {}).get("hersteller",""), "path": sp})
 
-    # Ladepunkte datasheets
     for i, lp in enumerate(d.get("mobilität", {}).get("ladepunkte", []), start=1):
-        p = lp.get("datasheet", "")
+        p = str(lp.get("datasheet", "") or "")
         if p:
             items.append({"type": "Ladestation", "name": f"LP {i}: {lp.get('name','')}", "path": p})
 
-    # Fahrzeuge datasheets
     for i, fz in enumerate(d.get("mobilität", {}).get("fuhrpark", []), start=1):
-        p = fz.get("datasheet", "")
+        p = str(fz.get("datasheet", "") or "")
         if p:
             items.append({"type": "Fahrzeug", "name": f"FZ {i}: {fz.get('klasse','')}", "path": p})
 
@@ -1176,6 +1097,13 @@ def export_word(report_path: Path, d: dict, sim_kpis: dict):
     doc.add_paragraph(f"Kunde: {d['kunde'].get('name','—')}")
     doc.add_paragraph(f"Datum: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
+    doc.add_heading("Gebäudeanschluss", level=2)
+    mode = d["tech"].get("hak_mode", "Ampere")
+    if mode == "kW":
+        doc.add_paragraph(f"HAK: {float(d['tech'].get('hak_kw', 0.0)):.1f} kW (eingetragen) ~ {_hak_ampere_from_kw(float(d['tech'].get('hak_kw',0.0)))} A")
+    else:
+        doc.add_paragraph(f"HAK: {int(d['tech'].get('hak_ampere',63))} A ~ {_hak_kw_from_ampere(float(d['tech'].get('hak_ampere',63))):.1f} kW")
+
     doc.add_heading("Dachflächen", level=2)
     for r in d["daecher"]:
         doc.add_paragraph(
@@ -1187,21 +1115,23 @@ def export_word(report_path: Path, d: dict, sim_kpis: dict):
     doc.add_paragraph(
         f"Gesamt kWp: {float(d['pv'].get('total_kwp',0)):.2f} | WR-AC: {float(d['pv'].get('total_ac_kw',0)):.1f} kW | Konzept: {d['pv'].get('konzept','')}"
     )
-    doc.add_paragraph(f"Module/Strings: {len(d['pv'].get('felder',[]))} | WR: {len(d['pv'].get('wr',[]))}")
 
     doc.add_heading("Speicher", level=2)
     s = d["speicher"]
     doc.add_paragraph(f"{s.get('hersteller','')} | {float(s.get('kap',0)):.1f} kWh | {float(s.get('p',0)):.1f} kW | {s.get('spannung','')}")
+    doc.add_paragraph(
+        f"Mindestladung: {float(s.get('min_soc_pct',10)):.1f}% | Zyklen (Life): {int(s.get('cycle_life',6000))} | Lebensdauer: {int(s.get('calendar_life_years',15))} Jahre"
+    )
     arb = s.get("arbitrage", {})
     doc.add_paragraph(
-        f"Arbitrage aktiviert: {arb.get('enabled', False)} | Mode: {arb.get('mode','Manuell')} | "
-        f"Continuous SOC: {arb.get('continuous_soc', True)} | "
+        f"Arbitrage: {arb.get('enabled', False)} | Mode: {arb.get('mode','Manuell')} | "
+        f"Terminal: {arb.get('terminal_mode','End-SOC = SOC_min')} | "
         f"Annual Profit Est: {float(arb.get('annual_profit_est',0)):,.0f} €/a | Cycles Est: {float(arb.get('annual_cycles_est',0)):.1f}/a"
     )
 
     doc.add_heading("Simulation KPIs", level=2)
     if not sim_kpis:
-        doc.add_paragraph("Keine Simulation-KPIs vorhanden (bitte Simulation ausführen).")
+        doc.add_paragraph("Keine Simulation-KPIs vorhanden.")
     else:
         for k, v in sim_kpis.items():
             doc.add_paragraph(f"- {k}: {v}")
@@ -1233,6 +1163,14 @@ def export_pdf(report_path: Path, d: dict, sim_kpis: dict):
     c.drawString(50, y, f"Kunde: {d['kunde'].get('name','—')}")
     y -= 15
     c.drawString(50, y, f"Datum: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    y -= 20
+
+    mode = d["tech"].get("hak_mode", "Ampere")
+    if mode == "kW":
+        line = f"HAK: {float(d['tech'].get('hak_kw', 0.0)):.1f} kW (eingetragen) ~ {_hak_ampere_from_kw(float(d['tech'].get('hak_kw',0.0)))} A"
+    else:
+        line = f"HAK: {int(d['tech'].get('hak_ampere',63))} A ~ {_hak_kw_from_ampere(float(d['tech'].get('hak_ampere',63))):.1f} kW"
+    c.drawString(50, y, line[:120])
     y -= 25
 
     c.setFont("Helvetica-Bold", 12)
@@ -1256,7 +1194,7 @@ def export_pdf(report_path: Path, d: dict, sim_kpis: dict):
     y -= 14
     s = d["speicher"]
     arb = s.get("arbitrage", {})
-    c.drawString(55, y, f"Speicher: {float(s.get('kap',0)):.1f} kWh / {float(s.get('p',0)):.1f} kW | Arbitrage: {arb.get('enabled',False)} | Profit Est: {float(arb.get('annual_profit_est',0)):,.0f} €/a"[:120])
+    c.drawString(55, y, f"Speicher: {float(s.get('kap',0)):.1f} kWh / {float(s.get('p',0)):.1f} kW | Arbitrage: {arb.get('enabled',False)} | Terminal: {arb.get('terminal_mode','')}"[:120])
     y -= 18
 
     c.setFont("Helvetica-Bold", 12)
@@ -1264,7 +1202,7 @@ def export_pdf(report_path: Path, d: dict, sim_kpis: dict):
     y -= 18
     c.setFont("Helvetica", 10)
     if not sim_kpis:
-        c.drawString(55, y, "Keine Simulation-KPIs vorhanden (bitte Simulation ausführen).")
+        c.drawString(55, y, "Keine Simulation-KPIs vorhanden.")
         y -= 14
     else:
         for k, v in sim_kpis.items():
@@ -1298,7 +1236,68 @@ def export_pdf(report_path: Path, d: dict, sim_kpis: dict):
     c.save()
 
 
-def build_zip_package(zip_path: Path, files: list[Path]) -> Path:
+def generate_index_html(project_slug: str, d: dict, created_ts: str, docs_root: Path) -> str:
+    # Links im ZIP beziehen sich auf Pfade wie "projects/<slug>/documents/..."
+    base = f"projects/{project_slug}/documents"
+    files = sorted([p for p in docs_root.rglob("*.*") if p.is_file()], key=lambda x: x.as_posix())
+
+    # Reports prominent
+    reports = [p for p in files if "/reports/" in p.as_posix().replace("\\", "/")]
+    atts = collect_attachments(d)
+
+    def li(href: str, label: str) -> str:
+        return f'<li><a href="{href}">{label}</a></li>'
+
+    html = []
+    html.append("<!doctype html><html><head><meta charset='utf-8'>")
+    html.append("<title>Projektpaket – Übersicht</title>")
+    html.append("<style>body{font-family:Arial,Helvetica,sans-serif;margin:24px;} h1{margin:0 0 8px;} .small{color:#666;font-size:12px;} code{background:#f4f4f4;padding:2px 4px;border-radius:4px;}</style>")
+    html.append("</head><body>")
+    html.append(f"<h1>Projektpaket – {project_slug}</h1>")
+    html.append(f"<div class='small'>Erstellt: {created_ts} | Kunde: <b>{d.get('kunde',{}).get('name','—')}</b></div>")
+
+    mode = d.get("tech", {}).get("hak_mode", "Ampere")
+    if mode == "kW":
+        hak_line = f"{float(d['tech'].get('hak_kw',0.0)):.1f} kW (~ {_hak_ampere_from_kw(float(d['tech'].get('hak_kw',0.0)))} A)"
+    else:
+        hak_line = f"{int(d['tech'].get('hak_ampere',63))} A (~ {_hak_kw_from_ampere(float(d['tech'].get('hak_ampere',63))):.1f} kW)"
+    html.append(f"<p><b>Gebäudeanschluss:</b> {hak_line}</p>")
+
+    html.append("<h2>Reports</h2><ul>")
+    if not reports:
+        html.append("<li>Keine Reports gefunden.</li>")
+    else:
+        for p in reports:
+            rel = p.as_posix().replace(docs_root.as_posix().replace("\\", "/"), base).replace("\\", "/")
+            html.append(li(rel, p.name))
+    html.append("</ul>")
+
+    html.append("<h2>Anlagen / Datenblätter (aus Feldern)</h2><ul>")
+    if not atts:
+        html.append("<li>Keine Anhänge hinterlegt.</li>")
+    else:
+        for a in atts:
+            p = a.get("path", "")
+            # pfad im zip: projects/<slug>/... wenn es darunter liegt
+            if p.startswith("projects/"):
+                rel = p.replace("\\", "/")
+            else:
+                rel = p.replace("\\", "/")
+            html.append(li(rel, f"[{a.get('type','')}] {a.get('name','')}"))
+    html.append("</ul>")
+
+    html.append("<h2>Alle Dateien im Paket</h2><ul>")
+    for p in files:
+        rel = p.as_posix().replace(docs_root.as_posix().replace("\\", "/"), base).replace("\\", "/")
+        html.append(li(rel, rel))
+    html.append("</ul>")
+
+    html.append("<p class='small'>Hinweis: Öffne diese Datei nach dem Entpacken im Browser. Die Links funktionieren innerhalb der Ordnerstruktur.</p>")
+    html.append("</body></html>")
+    return "\n".join(html)
+
+
+def build_zip_package(zip_path: Path, files: list[Path], extra_bytes: dict[str, bytes] | None = None) -> Path:
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for f in files:
@@ -1307,55 +1306,32 @@ def build_zip_package(zip_path: Path, files: list[Path]) -> Path:
                     z.write(f, arcname=str(f).replace("\\", "/"))
             except Exception:
                 pass
+        if extra_bytes:
+            for arcname, b in extra_bytes.items():
+                try:
+                    z.writestr(arcname, b)
+                except Exception:
+                    pass
     return zip_path
 
 
-def gather_project_package_files(project_base: Path, d: dict, state_file: Path) -> list[Path]:
+def gather_project_package_files(project_base: Path, docs_root: Path, state_file: Path) -> list[Path]:
     files: list[Path] = []
-    # state.json
     if state_file.exists():
         files.append(state_file)
 
-    # attachments
-    for a in collect_attachments(d):
-        try:
-            p = Path(a["path"])
-            if p.exists():
-                files.append(p)
-        except Exception:
-            pass
+    for folder in [
+        docs_root / "reports",
+        docs_root / "datasheets",
+        docs_root / "inputs",
+        docs_root / "arbitrage",
+    ]:
+        if folder.exists():
+            for p in folder.rglob("*.*"):
+                if p.is_file():
+                    files.append(p)
 
-    # include all reports (optional)
-    reports_dir = project_base / "documents" / "reports"
-    if reports_dir.exists():
-        for p in reports_dir.rglob("*.*"):
-            if p.is_file():
-                files.append(p)
-
-    # include all datasheets folders (optional, but keep size sane)
-    ds_dir = project_base / "documents" / "datasheets"
-    if ds_dir.exists():
-        for p in ds_dir.rglob("*.*"):
-            if p.is_file():
-                files.append(p)
-
-    # include inputs
-    inp_dir = project_base / "documents" / "inputs"
-    if inp_dir.exists():
-        for p in inp_dir.rglob("*.*"):
-            if p.is_file():
-                files.append(p)
-
-    # include arbitrage exports
-    arb_dir = project_base / "documents" / "arbitrage"
-    if arb_dir.exists():
-        for p in arb_dir.rglob("*.*"):
-            if p.is_file():
-                files.append(p)
-
-    # dedupe
-    seen = set()
-    uniq = []
+    seen, uniq = set(), []
     for p in files:
         sp = str(p)
         if sp not in seen:
@@ -1385,7 +1361,7 @@ else:
     deep_merge(d, DEFAULTS)
     migrate_legacy(d)
 
-hak_kw = hak_p_max_kw(int(d["tech"].get("hak_ampere", 63)))
+hak_kw = hak_p_max_kw_from_state(d)
 
 
 # ================================================================
@@ -1398,13 +1374,23 @@ with st.sidebar:
 
     st.divider()
     st.header("⚡ Gebäudeanschluss")
-    d["tech"]["hak_ampere"] = st.selectbox(
-        "HAK Größe (Ampere)",
-        HAK_OPTIONS,
-        index=safe_index(HAK_OPTIONS, int(d["tech"].get("hak_ampere", 63)), 2),
-    )
-    hak_kw = hak_p_max_kw(int(d["tech"]["hak_ampere"]))
+    d["tech"]["hak_mode"] = st.radio("Eingabeart", HAK_MODE_OPTIONS, index=safe_index(HAK_MODE_OPTIONS, d["tech"].get("hak_mode", "Ampere"), 0), horizontal=True)
+
+    if d["tech"]["hak_mode"] == "Ampere":
+        d["tech"]["hak_ampere"] = st.selectbox(
+            "HAK Größe (Ampere)",
+            HAK_OPTIONS,
+            index=safe_index(HAK_OPTIONS, int(d["tech"].get("hak_ampere", 63)), 2),
+        )
+        hak_kw = _hak_kw_from_ampere(float(d["tech"]["hak_ampere"]))
+        d["tech"]["hak_kw"] = round(float(hak_kw), 1)
+    else:
+        d["tech"]["hak_kw"] = st.number_input("HAK Größe (kW)", 1.0, 20000.0, float(d["tech"].get("hak_kw", _hak_kw_from_ampere(63))), step=1.0)
+        hak_kw = float(d["tech"]["hak_kw"])
+        d["tech"]["hak_ampere"] = _hak_ampere_from_kw(hak_kw)
+
     st.metric("Max. Belastbarkeit (theoret.)", f"{hak_kw:.1f} kW")
+    st.caption(f"≈ {int(d['tech'].get('hak_ampere',63))} A bei 400V/3~")
 
     st.divider()
     if st.button("💾 Projektstand speichern", use_container_width=True):
@@ -1425,7 +1411,7 @@ if "Speicher" in d["scope"]:
     tab_names.append("🔋 Speicher & Arbitrage")
 if "Ladeinfrastruktur" in d["scope"]:
     tab_names.append("🔌 E-Mobilität")
-tab_names.append("📈 Daten, Simulation & ROI")
+tab_names.append("📈 Simulation & ROI")
 tab_names.append("🧾 Report & Dateien")
 
 tabs = st.tabs(tab_names)
@@ -1486,10 +1472,9 @@ if "PV-System" in d["scope"]:
                     c9, c10, c11 = st.columns([1, 1, 1])
                     r["nutzfaktor"] = c9.slider("Nutzfaktor", 0.30, 0.95, float(r.get("nutzfaktor", 0.80)), 0.01, key=f"roof_nf_{i}")
                     r["module_area_m2"] = c10.number_input("Modulfläche (m²)", 0.5, 5.0, float(r.get("module_area_m2", 2.0)), 0.1, key=f"roof_ma_{i}")
-
                     r["pv_kwp_manual_enabled"] = c11.checkbox("PV-kWp manuell", value=bool(r.get("pv_kwp_manual_enabled", False)), key=f"roof_pvman_{i}")
                     if r["pv_kwp_manual_enabled"]:
-                        r["pv_kwp_manual"] = st.number_input("PV-Leistung für dieses Dach (kWp)", 0.0, 500000.0, float(r.get("pv_kwp_manual", 0.0)), key=f"roof_pvman_val_{i}")
+                        r["pv_kwp_manual"] = st.number_input("PV-Leistung (kWp) dieses Dach", 0.0, 500000.0, float(r.get("pv_kwp_manual", 0.0)), key=f"roof_pvman_val_{i}")
 
                     cap_mod = roof_module_capacity(r)
                     used_mod = modules_from_fields(d["pv"]["felder"], r["id"])
@@ -1506,15 +1491,26 @@ if "PV-System" in d["scope"]:
                     r["hinweis"] = st.text_input("Hinweis (optional)", r.get("hinweis", ""), key=f"roof_note_{i}")
 
                     if st.button("🗑️ Dachfläche löschen", key=f"roof_del_{i}"):
+                        deleted_id = r.get("id")
                         d["daecher"].pop(i)
                         if len(d["daecher"]) == 0:
                             d["daecher"].append(DEFAULTS["daecher"][0])
                         ensure_roof_ids(d)
+                        keep_roof_ids = {rr["id"] for rr in d["daecher"]}
+                        fallback_id = d["daecher"][0]["id"]
+                        for f in d["pv"]["felder"]:
+                            if f.get("roof_id") not in keep_roof_ids:
+                                f["roof_id"] = fallback_id
+                        # falls gelöschtes Dach noch referenziert wird (safety)
+                        if deleted_id and deleted_id not in keep_roof_ids:
+                            for f in d["pv"]["felder"]:
+                                if f.get("roof_id") == deleted_id:
+                                    f["roof_id"] = fallback_id
                         st.rerun()
 
         st.divider()
 
-        st.subheader("🟦 PV-Modulfelder (mit Dach-Zuordnung)")
+        st.subheader("🟦 PV-Modulfelder (mit Dach-Zuordnung + Löschen + Datenblatt)")
         roof_map = {r["id"]: r.get("name", r["id"]) for r in d["daecher"]}
         roof_ids = list(roof_map.keys())
 
@@ -1528,43 +1524,33 @@ if "PV-System" in d["scope"]:
                 "datasheet": "",
             })
 
-        df_fields = pd.DataFrame(d["pv"]["felder"]) if d["pv"]["felder"] else pd.DataFrame(
-            columns=["roof_id", "hersteller", "typ", "watt_pro_modul", "anzahl_module", "datasheet"]
-        )
-        if not df_fields.empty:
-            df_fields["roof_name"] = df_fields["roof_id"].map(roof_map).fillna(df_fields["roof_id"])
-            df_fields = df_fields[["roof_id", "roof_name", "hersteller", "typ", "watt_pro_modul", "anzahl_module", "datasheet"]]
+        if not d["pv"]["felder"]:
+            st.info("Noch keine PV-Felder angelegt.")
+        else:
+            for i, f in enumerate(list(d["pv"]["felder"])):
+                title = f"Feld {i+1}: {f.get('typ','') or '—'}"
+                with st.expander(title, expanded=(i == 0)):
+                    c1, c2, c3 = st.columns([1.2, 1, 1])
+                    f["roof_id"] = c1.selectbox("Dach", options=roof_ids, index=safe_index(roof_ids, f.get("roof_id", roof_ids[0] if roof_ids else "roof-1"), 0), key=f"pvf_roof_{i}")
+                    f["hersteller"] = c2.text_input("Hersteller", f.get("hersteller", ""), key=f"pvf_h_{i}")
+                    f["typ"] = c3.text_input("Typ", f.get("typ", ""), key=f"pvf_t_{i}")
 
-        edited = st.data_editor(
-            df_fields,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "roof_id": st.column_config.SelectboxColumn("Dach-ID", options=roof_ids),
-                "roof_name": st.column_config.TextColumn("Dach", disabled=True),
-                "hersteller": st.column_config.TextColumn("Hersteller"),
-                "typ": st.column_config.TextColumn("Typ"),
-                "watt_pro_modul": st.column_config.NumberColumn("Watt/Modul", min_value=0, max_value=2000, step=5),
-                "anzahl_module": st.column_config.NumberColumn("Module", min_value=0, max_value=500000, step=1),
-                "datasheet": st.column_config.TextColumn("Datenblatt (Pfad)", disabled=True),
-            },
-            key="pv_fields_editor_full",
-        )
+                    c4, c5, c6 = st.columns([1, 1, 1])
+                    f["watt_pro_modul"] = c4.number_input("Watt/Modul", 0, 2000, int(f.get("watt_pro_modul", 0) or 0), key=f"pvf_w_{i}")
+                    f["anzahl_module"] = c5.number_input("Anzahl Module", 0, 500000, int(f.get("anzahl_module", 0) or 0), key=f"pvf_n_{i}")
 
-        new_list = []
-        if edited is not None and not edited.empty:
-            for _, row in edited.iterrows():
-                new_list.append({
-                    "roof_id": str(row.get("roof_id", roof_ids[0] if roof_ids else "roof-1")),
-                    "hersteller": str(row.get("hersteller", "") or ""),
-                    "typ": str(row.get("typ", "") or ""),
-                    "watt_pro_modul": float(row.get("watt_pro_modul", 0) or 0),
-                    "anzahl_module": int(row.get("anzahl_module", 0) or 0),
-                    "datasheet": str(row.get("datasheet", "") or ""),
-                })
-        d["pv"]["felder"] = new_list
+                    with c6:
+                        up = st.file_uploader("Datenblatt (PDF)", type=None, key=f"pvf_ds_up_{i}")
+                        if up is not None:
+                            f["datasheet"] = save_uploaded_file(DATASHEETS / "pv_module", up, prefix="pvmod_")
+                            st.success("Gespeichert.")
+                        if f.get("datasheet"):
+                            st.code(f["datasheet"])
 
-        # Roof capacity check summary
+                    if st.button("🗑️ Modulfeld löschen", key=f"pvf_del_{i}"):
+                        d["pv"]["felder"].pop(i)
+                        st.rerun()
+
         with st.expander("Kapazitätscheck pro Dach (Summary)"):
             for r in d["daecher"]:
                 cap = roof_module_capacity(r)
@@ -1572,32 +1558,34 @@ if "PV-System" in d["scope"]:
                 pvk = float(r.get("pv_kwp_manual", 0.0)) if bool(r.get("pv_kwp_manual_enabled")) else pv_kwp_from_fields(d["pv"]["felder"], r["id"])
                 st.write(f"- **{r.get('name')}**: {used}/{cap} Module | PV: {pvk:.2f} kWp")
 
-        st.subheader("🚥 Wechselrichter")
+        st.divider()
+        st.subheader("🚥 Wechselrichter (Löschen + Datenblatt)")
+
         if st.button("➕ Wechselrichter hinzufügen"):
             d["pv"]["wr"].append({"modell": "", "ac_kw": 10.0, "datasheet": ""})
 
-        df_wr = pd.DataFrame(d["pv"]["wr"]) if d["pv"]["wr"] else pd.DataFrame(columns=["modell", "ac_kw", "datasheet"])
-        edited_wr = st.data_editor(
-            df_wr,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "modell": st.column_config.TextColumn("Modell"),
-                "ac_kw": st.column_config.NumberColumn("AC-Nennleistung (kW)", min_value=0.0, max_value=5_000_000.0, step=0.5),
-                "datasheet": st.column_config.TextColumn("Datenblatt (Pfad)", disabled=True),
-            },
-            key="wr_editor_full",
-        )
+        if not d["pv"]["wr"]:
+            st.info("Noch keine Wechselrichter angelegt.")
+        else:
+            for j, wri in enumerate(list(d["pv"]["wr"])):
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([1.5, 1, 1])
+                    wri["modell"] = c1.text_input("Modell", wri.get("modell", ""), key=f"wr_m_{j}")
+                    wri["ac_kw"] = c2.number_input("AC-Nennleistung (kW)", 0.0, 5_000_000.0, float(wri.get("ac_kw", 0.0) or 0.0), key=f"wr_p_{j}")
 
-        d["pv"]["wr"] = []
-        if edited_wr is not None and not edited_wr.empty:
-            for _, row in edited_wr.iterrows():
-                d["pv"]["wr"].append({
-                    "modell": str(row.get("modell", "") or ""),
-                    "ac_kw": float(row.get("ac_kw", 0.0) or 0.0),
-                    "datasheet": str(row.get("datasheet", "") or ""),
-                })
+                    with c3:
+                        up = st.file_uploader("Datenblatt", type=None, key=f"wr_ds_up_{j}")
+                        if up is not None:
+                            wri["datasheet"] = save_uploaded_file(DATASHEETS / "wechselrichter", up, prefix="wr_")
+                            st.success("Gespeichert.")
+                        if wri.get("datasheet"):
+                            st.code(wri["datasheet"])
 
+                    if st.button("🗑️ Wechselrichter löschen", key=f"wr_del_{j}"):
+                        d["pv"]["wr"].pop(j)
+                        st.rerun()
+
+        st.divider()
         d["pv"]["konzept"] = st.radio(
             "Einspeisekonzept",
             PV_KONZEPTE,
@@ -1634,6 +1622,13 @@ if "Speicher" in d["scope"]:
             s["p"] = st.number_input("Max. Lade/Entladeleistung (kW)", 0.0, 5_000_000.0, float(s.get("p", 0.0)))
             s["spannung"] = st.selectbox("Typ", BAT_TYPES, index=safe_index(BAT_TYPES, s.get("spannung", "Hochvolt"), 0))
 
+            st.subheader("Lebensdauer / Reserve / Effizienz")
+            c1, c2, c3, c4 = st.columns(4)
+            s["min_soc_pct"] = c1.number_input("Mindestladung (%)", 0.0, 50.0, float(s.get("min_soc_pct", 10.0)))
+            s["cycle_life"] = c2.number_input("Zyklen bis EoL", 100, 200000, int(s.get("cycle_life", 6000)))
+            s["calendar_life_years"] = c3.number_input("Lebensdauer (Jahre)", 1, 50, int(s.get("calendar_life_years", 15)))
+            s["eta_roundtrip"] = c4.number_input("Effizienz (Eigenverbrauch)", 0.50, 0.99, float(s.get("eta_roundtrip", 0.92)))
+
             st.caption("Datenblatt Speicher")
             up = st.file_uploader("Upload (PDF)", type=None, key="up_bat_ds_full")
             if up is not None:
@@ -1644,9 +1639,8 @@ if "Speicher" in d["scope"]:
 
         with right:
             st.subheader("🤖 KI-Speicherempfehlung (wenn leer)")
-            region_rec = st.selectbox("Region (PV-Ertrag)", list(REGIONS.keys()), index=safe_index(list(REGIONS.keys()), "Mitte", 1), key="region_rec_full")
             if float(s.get("kap", 0.0)) <= 0:
-                rec = recommend_storage(d, hak_kw, s.get("objective", OBJECTIVES[0]), region_rec)
+                rec = recommend_storage(d, hak_kw, s.get("objective", OBJECTIVES[0]))
                 a, b, c = st.columns(3)
                 a.metric("Empf. kWh", f"{rec['rec_kwh']}")
                 b.metric("Empf. kW", f"{rec['rec_kw']}")
@@ -1656,7 +1650,6 @@ if "Speicher" in d["scope"]:
                     st.warning("EMS/Lastmanagement empfohlen.")
                 for r in rec["reasons"]:
                     st.write(f"- {r}")
-
                 if st.button("✅ Empfehlung übernehmen", use_container_width=True):
                     s["kap"] = rec["rec_kwh"]
                     s["p"] = rec["rec_kw"]
@@ -1669,6 +1662,7 @@ if "Speicher" in d["scope"]:
         st.subheader("📈 Arbitrage – echte Optimierung mit Stundenpreisen")
 
         arbd = s["arbitrage"]
+
         if float(s.get("kap", 0.0)) <= 0 or float(s.get("p", 0.0)) <= 0:
             st.warning("Arbitrage wird erst sinnvoll, wenn Speicher-kWh und Speicher-kW gesetzt sind.")
 
@@ -1679,12 +1673,28 @@ if "Speicher" in d["scope"]:
 
             c1, c2, c3, c4 = st.columns(4)
             arbd["roundtrip_eff"] = c1.number_input("Roundtrip-Effizienz", 0.50, 0.99, float(arbd.get("roundtrip_eff", 0.90)))
-            arbd["dod"] = c2.number_input("DoD (nutzbarer Anteil)", 0.10, 1.00, float(arbd.get("dod", 0.90)))
+            use_min_soc = c2.checkbox("DoD aus Mindestladung ableiten", value=True)
+            if use_min_soc:
+                arbd["dod"] = float(np.clip(1.0 - float(s.get("min_soc_pct", 10.0)) / 100.0, 0.10, 1.0))
+                c2.caption(f"DoD = {arbd['dod']:.2f}")
+            else:
+                arbd["dod"] = c2.number_input("DoD (nutzbarer Anteil)", 0.10, 1.00, float(arbd.get("dod", 0.90)))
             arbd["degradation_eur_per_kwh_throughput"] = c3.number_input("Degradation/Throughput (€/kWh DC)", 0.0, 1.0, float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)))
             arbd["cycles_per_year"] = c4.number_input("Zyklen/Jahr (nur Manual)", 0, 2000, int(arbd.get("cycles_per_year", 180)))
 
             bat_kwh = float(s.get("kap", 0.0))
             bat_kw = float(s.get("p", 0.0))
+
+            # Terminal / Rolling Horizon
+            st.subheader("Terminal / Rolling Horizon")
+            term_opts = ["End-SOC = SOC_min", "End-SOC frei (kein Restwert)", "End-SOC frei (mit Restwert)"]
+            arbd["terminal_mode"] = st.selectbox("Terminal-Modus", term_opts, index=safe_index(term_opts, arbd.get("terminal_mode", term_opts[0]), 0))
+            term_val_opts = ["Auto (letzter Preis)", "Auto (Ø letzte 24h)", "Manuell"]
+            arbd["terminal_value_mode"] = st.selectbox("Restwert-Quelle (nur bei „mit Restwert“)", term_val_opts, index=safe_index(term_val_opts, arbd.get("terminal_value_mode", term_val_opts[0]), 0))
+            if arbd["terminal_value_mode"] == "Manuell":
+                arbd["terminal_value_eur_per_kwh"] = st.number_input("Restwert (€/kWh)", 0.0, 2.0, float(arbd.get("terminal_value_eur_per_kwh", 0.25)))
+
+            st.caption("„Mit Restwert“ bedeutet: Restenergie im Speicher wird am Horizont mit einem €/kWh bewertet (Rolling Horizon Näherung).")
 
             if arbd["mode"] == "Manuell":
                 c5, c6, c7 = st.columns(3)
@@ -1696,7 +1706,7 @@ if "Speicher" in d["scope"]:
                 st.metric("Arbitrage-Potenzial (grob, €/a)", f"{profit:,.0f}")
                 st.caption("Manual ist eine Faustformel. Für echte Optimierung: Auto-Modus.")
             else:
-                st.info("Auto: holt Stundenpreise und optimiert den Charge/Discharge-Plan. Optional kontinuierlich (SOC über Tage).")
+                st.info("Auto: holt Stundenpreise und optimiert den Charge/Discharge-Plan (kontinuierlich, SOC carry-over).")
 
                 arbd["source"] = st.selectbox(
                     "Quelle",
@@ -1733,7 +1743,6 @@ if "Speicher" in d["scope"]:
                     arbd["price_csv_unit"] = unit
 
                     if up_price is not None:
-                        # speichern fürs Projekt + Report/Package
                         arbd["price_csv_file"] = save_uploaded_file(INPUTS, up_price, prefix="prices_")
                         try:
                             s_csv = parse_price_csv(up_price.getvalue(), sep_p, dec_p, dtc, pc)
@@ -1756,7 +1765,6 @@ if "Speicher" in d["scope"]:
                                     lookback_days=int(arbd["lookback_days"]),
                                 )
                             else:
-                                # ENTSO-E optional mit Zukunft
                                 end = datetime.now() + timedelta(hours=int(arbd.get("lookahead_hours", 0)))
                                 start = end - timedelta(days=int(arbd["lookback_days"]))
                                 ser = fetch_entsoe_day_ahead_prices(
@@ -1773,26 +1781,27 @@ if "Speicher" in d["scope"]:
                         else:
                             arbitrage_fill_info_from_prices(arbd, ser)
 
-                            if bool(arbd.get("continuous_soc", True)):
-                                res = optimize_arbitrage_continuous(
-                                    prices_hourly_eur_per_kwh=ser,
-                                    cap_kwh=bat_kwh,
-                                    p_kw=bat_kw,
-                                    dod=float(arbd.get("dod", 0.90)),
-                                    roundtrip_eff=float(arbd.get("roundtrip_eff", 0.90)),
-                                    deg_cost_per_kwh_throughput=float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)),
-                                    soc_grid_points=int(arbd.get("soc_grid_points", 201)),
-                                )
-                            else:
-                                res = optimize_arbitrage_from_prices(
-                                    prices_hourly_eur_per_kwh=ser,
-                                    cap_kwh=bat_kwh,
-                                    p_kw=bat_kw,
-                                    dod=float(arbd.get("dod", 0.90)),
-                                    roundtrip_eff=float(arbd.get("roundtrip_eff", 0.90)),
-                                    deg_cost_per_kwh_throughput=float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)),
-                                    soc_grid_points=int(arbd.get("soc_grid_points", 201)),
-                                )
+                            # Terminal Restwert ableiten
+                            terminal_value = 0.0
+                            if arbd["terminal_mode"] == "End-SOC frei (mit Restwert)":
+                                if arbd.get("terminal_value_mode") == "Manuell":
+                                    terminal_value = float(arbd.get("terminal_value_eur_per_kwh", 0.0) or 0.0)
+                                elif arbd.get("terminal_value_mode") == "Auto (Ø letzte 24h)":
+                                    terminal_value = float(ser.tail(24).mean()) if len(ser) >= 1 else float(ser.iloc[-1])
+                                else:  # Auto letzter Preis
+                                    terminal_value = float(ser.iloc[-1])
+
+                            res = optimize_arbitrage_continuous(
+                                prices_hourly_eur_per_kwh=ser,
+                                cap_kwh=bat_kwh,
+                                p_kw=bat_kw,
+                                dod=float(arbd.get("dod", 0.90)),
+                                roundtrip_eff=float(arbd.get("roundtrip_eff", 0.90)),
+                                deg_cost_per_kwh_throughput=float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)),
+                                soc_grid_points=int(arbd.get("soc_grid_points", 201)),
+                                terminal_mode=str(arbd.get("terminal_mode", "End-SOC = SOC_min")),
+                                terminal_value_eur_per_kwh=float(terminal_value),
+                            )
 
                             arbd["annual_profit_est"] = round(float(res["profit_year"]), 2)
                             arbd["annual_throughput_kwh"] = round(float(res["throughput_year"]), 1)
@@ -1845,32 +1854,33 @@ if "Ladeinfrastruktur" in d["scope"]:
     with tabs[ti]:
         st.header("🔌 E-Mobilität")
 
-        st.subheader("Ladestationen")
+        st.subheader("1) Ladestationen (Löschen + Datenblatt)")
         if st.button("➕ Ladestation hinzufügen"):
             d["mobilität"]["ladepunkte"].append({"name": "Ladepunkt", "leistung_kw": 11, "datasheet": ""})
 
-        df_lp = pd.DataFrame(d["mobilität"]["ladepunkte"]) if d["mobilität"]["ladepunkte"] else pd.DataFrame(columns=["name", "leistung_kw", "datasheet"])
-        edited_lp = st.data_editor(
-            df_lp,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "name": st.column_config.TextColumn("Modell/Name"),
-                "leistung_kw": st.column_config.SelectboxColumn("Leistung (kW)", options=WB_POWER_OPTIONS),
-                "datasheet": st.column_config.TextColumn("Datenblatt (Pfad)", disabled=True),
-            },
-            key="lp_editor_full",
-        )
-        d["mobilität"]["ladepunkte"] = []
-        if edited_lp is not None and not edited_lp.empty:
-            for _, row in edited_lp.iterrows():
-                d["mobilität"]["ladepunkte"].append({
-                    "name": str(row.get("name", "") or ""),
-                    "leistung_kw": float(row.get("leistung_kw", 0.0) or 0.0),
-                    "datasheet": str(row.get("datasheet", "") or ""),
-                })
+        if not d["mobilität"]["ladepunkte"]:
+            st.info("Noch keine Ladestationen angelegt.")
+        else:
+            for i, lp in enumerate(list(d["mobilität"]["ladepunkte"])):
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([1.6, 1, 1])
+                    lp["name"] = c1.text_input("Name/Modell", lp.get("name", ""), key=f"lp_name_{i}")
+                    lp["leistung_kw"] = c2.selectbox("Leistung (kW)", WB_POWER_OPTIONS, index=safe_index(WB_POWER_OPTIONS, int(lp.get("leistung_kw", 11) or 11), 0), key=f"lp_p_{i}")
 
-        st.subheader("Fuhrpark (Energie-TCO)")
+                    with c3:
+                        up = st.file_uploader("Datenblatt", type=None, key=f"lp_ds_up_{i}")
+                        if up is not None:
+                            lp["datasheet"] = save_uploaded_file(DATASHEETS / "ladestationen", up, prefix="lp_")
+                            st.success("Gespeichert.")
+                        if lp.get("datasheet"):
+                            st.code(lp["datasheet"])
+
+                    if st.button("🗑️ Ladestation löschen", key=f"lp_del_{i}"):
+                        d["mobilität"]["ladepunkte"].pop(i)
+                        st.rerun()
+
+        st.divider()
+        st.subheader("2) Fuhrpark (Löschen + Datenblatt)")
         if st.button("➕ Fahrzeug hinzufügen"):
             d["mobilität"]["fuhrpark"].append({
                 "klasse": "PKW",
@@ -1881,32 +1891,30 @@ if "Ladeinfrastruktur" in d["scope"]:
                 "datasheet": "",
             })
 
-        df_fz = pd.DataFrame(d["mobilität"]["fuhrpark"]) if d["mobilität"]["fuhrpark"] else pd.DataFrame(columns=["klasse", "anzahl", "km_pro_jahr", "kwh_pro_100km", "l_pro_100km", "datasheet"])
-        edited_fz = st.data_editor(
-            df_fz,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "klasse": st.column_config.SelectboxColumn("Klasse", options=FZ_KLASSEN),
-                "anzahl": st.column_config.NumberColumn("Stück", min_value=0, max_value=100000, step=1),
-                "km_pro_jahr": st.column_config.NumberColumn("km/Jahr", min_value=0, max_value=5_000_000, step=100),
-                "kwh_pro_100km": st.column_config.NumberColumn("kWh/100km", min_value=0.0, max_value=300.0, step=0.5),
-                "l_pro_100km": st.column_config.NumberColumn("L/100km", min_value=0.0, max_value=120.0, step=0.1),
-                "datasheet": st.column_config.TextColumn("Datenblatt (Pfad)", disabled=True),
-            },
-            key="fz_editor_full",
-        )
-        d["mobilität"]["fuhrpark"] = []
-        if edited_fz is not None and not edited_fz.empty:
-            for _, row in edited_fz.iterrows():
-                d["mobilität"]["fuhrpark"].append({
-                    "klasse": str(row.get("klasse", "PKW") or "PKW"),
-                    "anzahl": int(row.get("anzahl", 0) or 0),
-                    "km_pro_jahr": float(row.get("km_pro_jahr", 0) or 0),
-                    "kwh_pro_100km": float(row.get("kwh_pro_100km", 0) or 0),
-                    "l_pro_100km": float(row.get("l_pro_100km", 0) or 0),
-                    "datasheet": str(row.get("datasheet", "") or ""),
-                })
+        if not d["mobilität"]["fuhrpark"]:
+            st.info("Noch keine Fahrzeuge angelegt.")
+        else:
+            for i, fz in enumerate(list(d["mobilität"]["fuhrpark"])):
+                with st.container(border=True):
+                    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
+                    fz["klasse"] = c1.selectbox("Klasse", FZ_KLASSEN, index=safe_index(FZ_KLASSEN, fz.get("klasse", "PKW"), 0), key=f"fz_k_{i}")
+                    fz["anzahl"] = c2.number_input("Stück", 0, 100000, int(fz.get("anzahl", 1) or 1), key=f"fz_a_{i}")
+                    fz["km_pro_jahr"] = c3.number_input("km/Jahr", 0, 5_000_000, int(fz.get("km_pro_jahr", 20000) or 0), step=500, key=f"fz_km_{i}")
+                    fz["kwh_pro_100km"] = c4.number_input("kWh/100km", 0.0, 300.0, float(fz.get("kwh_pro_100km", 18.0) or 0.0), step=0.5, key=f"fz_ec_{i}")
+                    fz["l_pro_100km"] = c5.number_input("L/100km", 0.0, 120.0, float(fz.get("l_pro_100km", 7.0) or 0.0), step=0.1, key=f"fz_dc_{i}")
+
+                    c6, c7 = st.columns([2, 1])
+                    with c6:
+                        up = st.file_uploader("Datenblatt Fahrzeug (optional)", type=None, key=f"fz_ds_up_{i}")
+                        if up is not None:
+                            fz["datasheet"] = save_uploaded_file(DATASHEETS / "fahrzeuge", up, prefix="fz_")
+                            st.success("Gespeichert.")
+                        if fz.get("datasheet"):
+                            st.code(fz["datasheet"])
+                    with c7:
+                        if st.button("🗑️ Fahrzeug löschen", key=f"fz_del_{i}"):
+                            d["mobilität"]["fuhrpark"].pop(i)
+                            st.rerun()
 
         strompreis = float(d["wirtschaft"].get("strompreis", 0.35))
         dieselpreis = float(d["wirtschaft"].get("dieselpreis", 1.70))
@@ -1923,24 +1931,25 @@ if "Ladeinfrastruktur" in d["scope"]:
             savings += (di_l * dieselpreis) - (ev_kwh * strompreis)
 
         d["mobilität"]["total_ev_kwh"] = float(ev_total)
+
         c1, c2 = st.columns(2)
         c1.metric("EV-Strombedarf", f"{ev_total:,.0f} kWh/a")
         c2.metric("Energiekosten-Delta", f"{savings:,.0f} €/a")
-        st.caption("Nur Energie-Kosten; kein kompletter TCO.")
 
         wb_sum = sum(float(lp.get("leistung_kw", 0.0) or 0.0) for lp in d["mobilität"]["ladepunkte"])
         pv_ac = float(d["pv"].get("total_ac_kw", 0.0))
         if (pv_ac + wb_sum) > hak_kw:
             st.error(f"🚨 HAK-Konflikt: WR-AC {pv_ac:.1f} kW + Ladeleistung {wb_sum:.1f} kW > HAK {hak_kw:.1f} kW")
+            st.info("➡️ Empfehlung: EMS/Lastmanagement + ggf. Anschlussleistung prüfen/beantragen.")
 
     ti += 1
 
 
 # ================================================================
-# TAB: DATEN, SIMULATION & ROI
+# TAB: SIMULATION & ROI
 # ================================================================
 with tabs[ti]:
-    st.header("📈 Daten, Simulation & ROI")
+    st.header("📈 Simulation & ROI")
 
     with st.expander("Preise & Annahmen", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
@@ -1954,74 +1963,52 @@ with tabs[ti]:
         d["wirtschaft"]["capex_bat_eur_per_kwh"] = c6.number_input("CAPEX Speicher (€/kWh)", 50.0, 2000.0, float(d["wirtschaft"].get("capex_bat_eur_per_kwh", 450.0)))
         d["wirtschaft"]["capex_bat_eur_per_kw"] = c7.number_input("CAPEX Speicher (€/kW)", 0.0, 2000.0, float(d["wirtschaft"].get("capex_bat_eur_per_kw", 200.0)))
 
-    st.subheader("Lastgang Import (CSV)")
-    up = st.file_uploader("CSV hochladen", type=["csv"], key="lastgang_upload_full")
-    if up is not None:
-        raw_path = save_uploaded_file(INPUTS, up, prefix="lastgang_")
-        d["wirtschaft"]["lastgang_file"] = raw_path
-        st.success(f"Gespeichert: {raw_path}")
-
-    last_df = None
-    if d["wirtschaft"].get("lastgang_file"):
-        try:
-            fpath = Path(d["wirtschaft"]["lastgang_file"])
-            content = fpath.read_bytes()
-
-            sep = st.text_input("CSV Separator", value=";", key="sep_last_full")
-            dec = st.text_input("Dezimaltrennzeichen", value=",", key="dec_last_full")
-            df = parse_lastgang_csv(content, sep=sep, decimal=dec)
-
-            st.write("Spalten:", list(df.columns))
-            dt_col = st.selectbox("Datetime-Spalte", options=list(df.columns), index=0 if len(df.columns) > 0 else 0, key="dtcol_last_full")
-            val_col = st.selectbox("Wert-Spalte", options=list(df.columns), index=1 if len(df.columns) > 1 else 0, key="valcol_last_full")
-
-            d["wirtschaft"]["lastgang_datetime_col"] = dt_col
-            d["wirtschaft"]["lastgang_value_col"] = val_col
-
-            df2 = ensure_datetime_index(df, dt_col)
-            s = pd.to_numeric(df2[val_col], errors="coerce").fillna(0.0)
-
-            resolution = st.selectbox("Simulationsauflösung", SIM_RES_OPTIONS, index=safe_index(SIM_RES_OPTIONS, d["wirtschaft"].get("lastgang_resolution", "15min"), 0), key="res_last_full")
-            d["wirtschaft"]["lastgang_resolution"] = resolution
-
-            is_power = st.checkbox("CSV Werte sind kW (Leistung) → in kWh/Step umrechnen", value=bool(d["wirtschaft"].get("lastgang_is_power_kw", True)))
-            d["wirtschaft"]["lastgang_is_power_kw"] = bool(is_power)
-
-            s_res = resample_series(s, resolution)
-            dt_h = (s_res.index[1] - s_res.index[0]).total_seconds() / 3600.0 if len(s_res.index) > 1 else 1.0
-            load_kwh_step = (s_res * dt_h) if is_power else s_res
-
-            last_df = pd.DataFrame({"load_kwh_step": load_kwh_step})
-            st.line_chart(last_df.tail(24 * 7))
-
-            d["wirtschaft"]["lastgang_jahr"] = float(load_kwh_step.sum())
-            st.caption(f"Aus Lastgang abgeleiteter Jahresverbrauch: {d['wirtschaft']['lastgang_jahr']:,.0f} kWh/a")
-        except Exception as e:
-            st.error(f"Lastgang konnte nicht gelesen werden: {e}")
-
-    st.divider()
-    st.subheader("Simulation (PV synthetisch, Lastgang echt)")
-
     pvkwp = float(d["pv"].get("total_kwp", 0.0))
     if pvkwp <= 0:
         st.info("Bitte PV konfigurieren.")
-    elif last_df is None:
-        st.info("Bitte Lastgang importieren (oder Lastgang-Datei auswählen).")
     else:
-        idx = last_df.index
+        s_load = load_lastgang_from_state(d)
+
+        resolution = str(d["wirtschaft"].get("lastgang_resolution", "15min") or "15min")
+        if resolution not in SIM_RES_OPTIONS:
+            resolution = "15min"
+
+        if s_load is None:
+            st.warning("Kein Lastgang in state.json gefunden → nutze synthetisches Lastprofil (Fallback).")
+            freq = "15T" if resolution == "15min" else "H"
+            idx = pd.date_range("2026-01-01", "2027-01-01", freq=freq, inclusive="left", tz=None)
+            seed = stable_seed(P_SLUG, region, pvkwp, "fallback")
+            s_load = build_synth_load(idx, float(d["wirtschaft"].get("lastgang_jahr", 5000)), seed)
+        else:
+            idx = s_load.index
+            d["wirtschaft"]["lastgang_jahr"] = float(s_load.sum())
+
         seed = stable_seed(P_SLUG, region, pvkwp, int(len(idx)))
 
         pv_kwh_step = build_synth_pv_profile(idx, pvkwp, region, seed)
         ev_kwh_year = float(d["mobilität"].get("total_ev_kwh", 0.0))
         ev_kwh_step = build_ev_profile(idx, ev_kwh_year, seed)
 
-        load_kwh_step = last_df["load_kwh_step"] + ev_kwh_step
-        bat_kwh = float(d["speicher"].get("kap", 0.0))
-        bat_kw = float(d["speicher"].get("p", 0.0))
+        load_kwh_step = s_load + ev_kwh_step
 
-        sim = simulate_timeseries(pv_kwh_step, load_kwh_step, bat_kwh, bat_kw, roundtrip_eff=0.92)
+        s = d["speicher"]
+        bat_kwh = float(s.get("kap", 0.0))
+        bat_kw = float(s.get("p", 0.0))
+        eta = float(s.get("eta_roundtrip", 0.92))
+        min_soc_pct = float(s.get("min_soc_pct", 10.0))
 
-        st.line_chart(sim[["PV", "Last", "Served"]].tail(24 * 7))
+        sim = simulate_timeseries(
+            pv_kwh_step,
+            load_kwh_step,
+            bat_kwh,
+            bat_kw,
+            roundtrip_eff=eta,
+            min_soc_pct=min_soc_pct,
+        )
+
+        st.subheader("Jahresverlauf (letzte 7 Tage)")
+        tail_n = (24 * 7) if resolution == "hour" else (24 * 7 * 4)
+        st.line_chart(sim[["PV", "Last", "Served"]].tail(tail_n))
 
         total_gen = float(sim["PV"].sum())
         total_load = float(sim["Last"].sum())
@@ -2040,12 +2027,12 @@ with tabs[ti]:
         st.caption(f"Netzeinspeisung: {total_export:,.0f} kWh/a")
 
         with st.expander("SoC / Import / Export"):
-            st.line_chart(sim[["SoC"]].tail(24 * 7))
-            st.line_chart(sim[["Import", "Export"]].tail(24 * 7))
+            st.line_chart(sim[["SoC"]].tail(tail_n))
+            st.line_chart(sim[["Import", "Export"]].tail(tail_n))
 
-        # ROI grob
         strompreis = float(d["wirtschaft"]["strompreis"])
         feedin = float(d["wirtschaft"]["einspeise_v"])
+
         baseline_cost = total_load * strompreis
         system_cost = (total_import * strompreis) - (total_export * feedin)
         annual_savings = baseline_cost - system_cost
@@ -2068,7 +2055,20 @@ with tabs[ti]:
         else:
             st.warning("Netto-Ersparnis ≤ 0 → Annahmen/Dimensionierung prüfen.")
 
-        # Arbitrage Add-on
+        if bat_kwh > 0:
+            throughput = float((sim["Charge"].abs() + sim["Discharge"].abs()).sum())
+            usable = max(bat_kwh * (1.0 - min_soc_pct / 100.0), 1e-9)
+            cycles_est = throughput / (2.0 * usable)
+            cycles_life = float(s.get("cycle_life", 6000))
+            years_cycle_limited = (cycles_life / cycles_est) if cycles_est > 1e-6 else float("inf")
+            years_calendar = float(s.get("calendar_life_years", 15))
+
+            st.subheader("🔁 Lebensdauer-Check (grob)")
+            c9, c10, c11 = st.columns(3)
+            c9.metric("Zyklen/Jahr (grob)", f"{cycles_est:,.0f}")
+            c10.metric("Zyklus-limit (Jahre)", f"{years_cycle_limited:.1f}" if np.isfinite(years_cycle_limited) else "—")
+            c11.metric("Kalender-Limit (Jahre)", f"{years_calendar:.0f}")
+
         arb = d["speicher"]["arbitrage"]
         if bool(arb.get("enabled")) and bat_kwh > 0 and bat_kw > 0:
             if arb.get("mode") == "Auto":
@@ -2080,7 +2080,6 @@ with tabs[ti]:
             st.metric("Arbitrage-Potenzial", f"{arb_profit:,.0f} €/a")
             st.metric("Netto inkl. Arbitrage", f"{(net_savings + arb_profit):,.0f} €/a")
 
-        # KPIs for report
         st.session_state["_last_sim_kpis"] = {
             "PV-Ertrag (kWh/a)": f"{total_gen:,.0f}",
             "Verbrauch (kWh/a)": f"{total_load:,.0f}",
@@ -2095,79 +2094,12 @@ ti += 1
 
 
 # ================================================================
-# TAB: REPORT & DATEIEN + DATASHEET MANAGER + ZIP PACKAGE
+# TAB: REPORT & DATEIEN + ZIP PACKAGE (mit index.html)
 # ================================================================
 with tabs[ti]:
     st.header("🧾 Report & Dateien")
 
-    st.subheader("Datenblätter / Anhänge verwalten")
-    st.caption("Wähle Komponente + Position → Upload → Pfad wird im Projekt gespeichert.")
-
-    comp = st.selectbox("Komponententyp", ["PV-Module (Felder)", "Wechselrichter", "Speicher", "Ladestationen", "Fahrzeuge"], index=0)
-
-    def _label_list(items, key_name: str, fallback_prefix: str):
-        labels = []
-        for i, it in enumerate(items):
-            v = str(it.get(key_name, "") or "")
-            if not v.strip():
-                v = f"{fallback_prefix} {i+1}"
-            labels.append(f"{i+1} – {v}")
-        return labels
-
-    if comp == "PV-Module (Felder)":
-        items = d["pv"]["felder"]
-        labels = _label_list(items, "typ", "Feld")
-        idx = st.selectbox("Position", options=list(range(len(items))) if items else [], format_func=lambda i: labels[i] if labels else "", key="ds_sel_pv_full")
-        up = st.file_uploader("Datenblatt upload (PDF)", type=None, key="ds_up_pv_full")
-        if up is not None and items:
-            items[idx]["datasheet"] = save_uploaded_file(DATASHEETS / "pv_module", up, prefix="pvmod_")
-            st.success("Gespeichert.")
-        if items and items[idx].get("datasheet"):
-            st.code(items[idx]["datasheet"])
-
-    elif comp == "Wechselrichter":
-        items = d["pv"]["wr"]
-        labels = _label_list(items, "modell", "WR")
-        idx = st.selectbox("Position", options=list(range(len(items))) if items else [], format_func=lambda i: labels[i] if labels else "", key="ds_sel_wr_full")
-        up = st.file_uploader("Datenblatt upload (PDF)", type=None, key="ds_up_wr_full")
-        if up is not None and items:
-            items[idx]["datasheet"] = save_uploaded_file(DATASHEETS / "wechselrichter", up, prefix="wr_")
-            st.success("Gespeichert.")
-        if items and items[idx].get("datasheet"):
-            st.code(items[idx]["datasheet"])
-
-    elif comp == "Speicher":
-        up = st.file_uploader("Datenblatt upload (PDF)", type=None, key="ds_up_bat_full2")
-        if up is not None:
-            d["speicher"]["datasheet"] = save_uploaded_file(DATASHEETS / "speicher", up, prefix="speicher_")
-            st.success("Gespeichert.")
-        if d["speicher"].get("datasheet"):
-            st.code(d["speicher"]["datasheet"])
-
-    elif comp == "Ladestationen":
-        items = d["mobilität"]["ladepunkte"]
-        labels = _label_list(items, "name", "LP")
-        idx = st.selectbox("Position", options=list(range(len(items))) if items else [], format_func=lambda i: labels[i] if labels else "", key="ds_sel_lp_full")
-        up = st.file_uploader("Datenblatt upload (PDF)", type=None, key="ds_up_lp_full")
-        if up is not None and items:
-            items[idx]["datasheet"] = save_uploaded_file(DATASHEETS / "ladestationen", up, prefix="lp_")
-            st.success("Gespeichert.")
-        if items and items[idx].get("datasheet"):
-            st.code(items[idx]["datasheet"])
-
-    else:  # Fahrzeuge
-        items = d["mobilität"]["fuhrpark"]
-        labels = _label_list(items, "klasse", "FZ")
-        idx = st.selectbox("Position", options=list(range(len(items))) if items else [], format_func=lambda i: labels[i] if labels else "", key="ds_sel_fz_full")
-        up = st.file_uploader("Datenblatt upload (PDF)", type=None, key="ds_up_fz_full")
-        if up is not None and items:
-            items[idx]["datasheet"] = save_uploaded_file(DATASHEETS / "fahrzeuge", up, prefix="fz_")
-            st.success("Gespeichert.")
-        if items and items[idx].get("datasheet"):
-            st.code(items[idx]["datasheet"])
-
-    st.divider()
-    st.subheader("Report erzeugen (PDF/Word) → documents/reports/ (druckbar via PDF)")
+    st.subheader("Report erzeugen (PDF/Word) → documents/reports/")
     sim_kpis = st.session_state.get("_last_sim_kpis", {})
 
     c1, c2, c3 = st.columns(3)
@@ -2190,18 +2122,27 @@ with tabs[ti]:
             except Exception as e:
                 st.error(str(e))
     with c3:
-        if st.button("📦 Projektpaket (ZIP) erstellen", use_container_width=True):
+        if st.button("📦 Bericht mit Anlagen (ZIP + Index.html) erstellen", use_container_width=True):
             try:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 zip_out = REPORTS / f"package_{P_SLUG}_{ts}.zip"
-                files = gather_project_package_files(BASE, d, STATE_FILE)
-                build_zip_package(zip_out, files)
+
+                # Index.html erzeugen (zusätzlich lokal ablegen)
+                idx_html = generate_index_html(P_SLUG, d, ts, DOCS)
+                idx_local = REPORTS / f"index_{P_SLUG}_{ts}.html"
+                idx_local.write_text(idx_html, encoding="utf-8")
+
+                # Dateien sammeln
+                files = gather_project_package_files(BASE, DOCS, STATE_FILE)
+
+                # index.html zusätzlich in ZIP-Root (bequemer)
+                build_zip_package(zip_out, files, extra_bytes={"index.html": idx_html.encode("utf-8")})
+
                 st.success(f"Erzeugt: {zip_out}")
                 st.session_state["_last_zip"] = str(zip_out)
             except Exception as e:
                 st.error(str(e))
 
-    # Quick download ZIP if created
     if st.session_state.get("_last_zip"):
         zp = Path(st.session_state["_last_zip"])
         if zp.exists():
@@ -2213,7 +2154,7 @@ with tabs[ti]:
     if not files:
         st.info("Noch keine Dateien im documents/ Ordner.")
     else:
-        for p in files[:80]:
+        for p in files[:140]:
             colA, colB = st.columns([3, 1])
             with colA:
                 st.write(str(p))
