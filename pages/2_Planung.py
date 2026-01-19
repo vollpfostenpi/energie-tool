@@ -1992,22 +1992,425 @@ if "PV-System" in d["scope"]:
 
     ti += 1
 
+
 # ================================================================
-# TAB: SPEICHER & ARBITRAGE (unverändert – bereits vollständig oben)
+# TAB: SPEICHER & ARBITRAGE
 # ================================================================
 if "Speicher" in d["scope"]:
-    # Für Übersichtlichkeit: du kannst hier einfach deinen vorhandenen Speicher-Tab aus deiner Version lassen.
-    # In diesem Export-Script ist er aus Platzgründen NICHT erneut eingefügt.
     with tabs[ti]:
-        st.info("🔋 Speicher-Tab: Bitte ersetze diesen Platzhalter durch deinen bestehenden Speicher/Arbitrage-Tab (aus deiner Version).")
+        st.header("🔋 Speicher (inkl. Arbitrage-Optimierung)")
+
+        s = d["speicher"]
+        left, right = st.columns([1, 1])
+
+        with left:
+            s["hersteller"] = st.text_input("Hersteller / System", s.get("hersteller", ""))
+            s["objective"] = st.selectbox("Ziel / Optimierung", OBJECTIVES, index=safe_index(OBJECTIVES, s.get("objective", OBJECTIVES[0]), 0))
+            s["kap"] = st.number_input("Kapazität (kWh)", 0.0, 5_000_000.0, float(s.get("kap", 0.0)))
+            s["p"] = st.number_input("Max. Lade/Entladeleistung (kW)", 0.0, 5_000_000.0, float(s.get("p", 0.0)))
+            s["spannung"] = st.selectbox("Typ", BAT_TYPES, index=safe_index(BAT_TYPES, s.get("spannung", "Hochvolt"), 0))
+
+            st.subheader("Lebensdauer / Reserve / Effizienz")
+            c1, c2, c3, c4 = st.columns(4)
+            s["min_soc_pct"] = c1.number_input("Mindestladung (%)", 0.0, 50.0, float(s.get("min_soc_pct", 10.0)))
+            s["cycle_life"] = c2.number_input("Zyklen bis EoL", 100, 200000, int(s.get("cycle_life", 6000)))
+            s["calendar_life_years"] = c3.number_input("Lebensdauer (Jahre)", 1, 50, int(s.get("calendar_life_years", 15)))
+            s["eta_roundtrip"] = c4.number_input("Effizienz (Eigenverbrauch)", 0.50, 0.99, float(s.get("eta_roundtrip", 0.92)))
+
+            st.caption("Datenblatt Speicher")
+            up = st.file_uploader("Upload (PDF)", type=None, key="up_bat_ds_full")
+            if up is not None:
+                s["datasheet"] = save_uploaded_file(DATASHEETS / "speicher", up, prefix="speicher_")
+                st.success("Gespeichert.")
+            if s.get("datasheet"):
+                st.code(s["datasheet"])
+
+        with right:
+            st.subheader("🤖 KI-Speicherempfehlung (wenn leer)")
+            if float(s.get("kap", 0.0)) <= 0:
+                rec = recommend_storage(d, hak_kw, s.get("objective", OBJECTIVES[0]))
+                a, b, c = st.columns(3)
+                a.metric("Empf. kWh", f"{rec['rec_kwh']}")
+                b.metric("Empf. kW", f"{rec['rec_kw']}")
+                c.metric("C-Rate", f"{rec['c_rate']}")
+                st.write(f"Typ: **{rec['typ']}**")
+                if rec["ems"]:
+                    st.warning("EMS/Lastmanagement empfohlen.")
+                for rr in rec["reasons"]:
+                    st.write(f"- {rr}")
+                if st.button("✅ Empfehlung übernehmen", use_container_width=True):
+                    s["kap"] = rec["rec_kwh"]
+                    s["p"] = rec["rec_kw"]
+                    s["spannung"] = rec["typ"]
+                    st.rerun()
+            else:
+                st.info("Speicher ist hinterlegt – Empfehlung wird angezeigt, wenn kWh = 0 ist.")
+
+        st.divider()
+        st.subheader("📈 Arbitrage – echte Optimierung mit Stundenpreisen")
+        arbd = s["arbitrage"]
+
+        if float(s.get("kap", 0.0)) <= 0 or float(s.get("p", 0.0)) <= 0:
+            st.warning("Arbitrage wird erst sinnvoll, wenn Speicher-kWh und Speicher-kW gesetzt sind.")
+
+        arbd["enabled"] = st.checkbox("Arbitrage aktivieren", value=bool(arbd.get("enabled", False)))
+
+        if arbd["enabled"]:
+            arbd["mode"] = st.radio("Modus", ["Manuell", "Auto"], index=0 if arbd.get("mode", "Manuell") == "Manuell" else 1, horizontal=True)
+
+            c1, c2, c3, c4 = st.columns(4)
+            arbd["roundtrip_eff"] = c1.number_input("Roundtrip-Effizienz", 0.50, 0.99, float(arbd.get("roundtrip_eff", 0.90)))
+            use_min_soc = c2.checkbox("DoD aus Mindestladung ableiten", value=True)
+            if use_min_soc:
+                arbd["dod"] = float(np.clip(1.0 - float(s.get("min_soc_pct", 10.0)) / 100.0, 0.10, 1.0))
+                c2.caption(f"DoD = {arbd['dod']:.2f}")
+            else:
+                arbd["dod"] = c2.number_input("DoD (nutzbarer Anteil)", 0.10, 1.00, float(arbd.get("dod", 0.90)))
+            arbd["degradation_eur_per_kwh_throughput"] = c3.number_input("Degradation/Throughput (€/kWh DC)", 0.0, 1.0, float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)))
+            arbd["cycles_per_year"] = c4.number_input("Zyklen/Jahr (nur Manual)", 0, 2000, int(arbd.get("cycles_per_year", 180)))
+
+            bat_kwh = float(s.get("kap", 0.0))
+            bat_kw = float(s.get("p", 0.0))
+
+            st.subheader("Terminal / Rolling Horizon")
+            term_opts = ["End-SOC = SOC_min", "End-SOC frei (kein Restwert)", "End-SOC frei (mit Restwert)"]
+            arbd["terminal_mode"] = st.selectbox("Terminal-Modus", term_opts, index=safe_index(term_opts, arbd.get("terminal_mode", term_opts[0]), 0))
+            term_val_opts = ["Auto (letzter Preis)", "Auto (Ø letzte 24h)", "Manuell"]
+            arbd["terminal_value_mode"] = st.selectbox("Restwert-Quelle (nur bei „mit Restwert“)", term_val_opts, index=safe_index(term_val_opts, arbd.get("terminal_value_mode", term_val_opts[0]), 0))
+            if arbd["terminal_value_mode"] == "Manuell":
+                arbd["terminal_value_eur_per_kwh"] = st.number_input("Restwert (€/kWh)", 0.0, 2.0, float(arbd.get("terminal_value_eur_per_kwh", 0.25)))
+
+            arbd["continuous_soc"] = st.checkbox("Kontinuierlich (SOC carry-over)", value=bool(arbd.get("continuous_soc", True)))
+            st.caption("Tipp: „End-SOC frei (mit Restwert)“ + kontinuierlich ist eine gute Rolling-Horizon-Näherung.")
+
+            if arbd["mode"] == "Manuell":
+                c5, c6, c7 = st.columns(3)
+                arbd["low_price"] = c5.number_input("Low-Price (€/kWh)", 0.0, 2.0, float(arbd.get("low_price", 0.18)))
+                arbd["high_price"] = c6.number_input("High-Price (€/kWh)", 0.0, 2.0, float(arbd.get("high_price", 0.32)))
+                arbd["spread"] = c7.number_input("Spread (€/kWh)", 0.0, 2.0, float(arbd.get("spread", 0.14)))
+
+                profit = arbitrage_profit_manual_rough(arbd, bat_kwh)
+                st.metric("Arbitrage-Potenzial (grob, €/a)", f"{profit:,.0f} €")
+                st.caption("Manual ist eine Faustformel. Für echte Optimierung: Auto-Modus.")
+            else:
+                st.info("Auto: holt Stundenpreise und optimiert den Charge/Discharge-Plan.")
+                arbd["source"] = st.selectbox(
+                    "Quelle",
+                    ["SMARD (DE/LU)", "ENTSO-E (Token)", "CSV Upload"],
+                    index=0 if str(arbd.get("source", "SMARD (DE/LU)")).startswith("SMARD") else (1 if str(arbd.get("source", "")).startswith("ENTSO") else 2)
+                )
+
+                c8, c9, c10, c11 = st.columns(4)
+                arbd["lookback_days"] = c8.number_input("Lookback (Tage, historisch)", 7, 365, int(arbd.get("lookback_days", 30)))
+                arbd["lookahead_hours"] = c9.number_input("Lookahead (Stunden, Zukunft falls verfügbar)", 0, 96, int(arbd.get("lookahead_hours", 0)))
+                arbd["low_quantile"] = c10.number_input("Low-Quantil (Info)", 0.0, 0.5, float(arbd.get("low_quantile", 0.20)))
+                arbd["high_quantile"] = c11.number_input("High-Quantil (Info)", 0.5, 1.0, float(arbd.get("high_quantile", 0.80)))
+
+                arbd["soc_grid_points"] = st.slider("SOC-Gitter (Genauigkeit vs. Speed)", 101, 401, int(arbd.get("soc_grid_points", 201)), 50)
+
+                price_series = None
+
+                if arbd["source"].startswith("SMARD"):
+                    arbd["smard_series_id"] = st.number_input("SMARD Series-ID", 1, 99_999_999, int(arbd.get("smard_series_id", 8004169)))
+                    arbd["smard_region"] = st.text_input("SMARD Region", value=str(arbd.get("smard_region", "DE-LU")))
+                elif arbd["source"].startswith("ENTSO"):
+                    arbd["entsoe_token"] = st.text_input("ENTSO-E Token", value=str(arbd.get("entsoe_token", "")), type="password")
+                    arbd["entsoe_bidding_zone"] = st.text_input("Bidding Zone (entsoe-py)", value=str(arbd.get("entsoe_bidding_zone", "DE_LU")))
+                else:
+                    up_price = st.file_uploader("Preis-CSV Upload (Datetime + Preis)", type=["csv"], key="price_csv_up_full")
+                    sep_p = st.text_input("CSV Separator (Preise)", value=";", key="price_sep_full")
+                    dec_p = st.text_input("Dezimal (Preise)", value=",", key="price_dec_full")
+                    dtc = st.text_input("Datetime-Spalte", value="timestamp", key="price_dtcol_full")
+                    pc = st.text_input("Preis-Spalte", value="price", key="price_col_full")
+                    unit = st.selectbox("Einheit", ["EUR/kWh", "EUR/MWh"], index=0 if str(arbd.get("price_csv_unit", "EUR/kWh")) == "EUR/kWh" else 1, key="price_unit_full")
+                    arbd["price_csv_unit"] = unit
+
+                    if up_price is not None:
+                        arbd["price_csv_file"] = save_uploaded_file(INPUTS, up_price, prefix="prices_")
+                        try:
+                            s_csv = parse_price_csv(up_price.getvalue(), sep_p, dec_p, dtc, pc)
+                            if unit == "EUR/MWh":
+                                s_csv = s_csv / 1000.0
+                            price_series = s_csv
+                            st.success(f"Preise geladen: {len(price_series)} Stunden")
+                            st.line_chart(price_series.tail(24 * 7))
+                        except Exception as e:
+                            st.error(str(e))
+
+                if st.button("🤖 Preise holen & echte Optimierung rechnen", use_container_width=True):
+                    try:
+                        if price_series is None:
+                            if arbd["source"].startswith("SMARD"):
+                                ser = fetch_smard_day_ahead_prices(
+                                    series_id=int(arbd["smard_series_id"]),
+                                    region=str(arbd["smard_region"]),
+                                    resolution="hour",
+                                    lookback_days=int(arbd["lookback_days"]),
+                                )
+                            else:
+                                end = datetime.now() + timedelta(hours=int(arbd.get("lookahead_hours", 0)))
+                                start = end - timedelta(days=int(arbd["lookback_days"]))
+                                ser = fetch_entsoe_day_ahead_prices(
+                                    token=str(arbd.get("entsoe_token", "")),
+                                    bidding_zone=str(arbd.get("entsoe_bidding_zone", "DE_LU")),
+                                    start=start,
+                                    end=end,
+                                )
+                        else:
+                            ser = price_series
+
+                        if ser.empty:
+                            st.error("Keine Preisdaten erhalten.")
+                        else:
+                            arbitrage_fill_info_from_prices(arbd, ser)
+
+                            terminal_value = 0.0
+                            if arbd["terminal_mode"] == "End-SOC frei (mit Restwert)":
+                                if arbd.get("terminal_value_mode") == "Manuell":
+                                    terminal_value = float(arbd.get("terminal_value_eur_per_kwh", 0.0) or 0.0)
+                                elif arbd.get("terminal_value_mode") == "Auto (Ø letzte 24h)":
+                                    terminal_value = float(ser.tail(24).mean()) if len(ser) >= 1 else float(ser.iloc[-1])
+                                else:
+                                    terminal_value = float(ser.iloc[-1])
+
+                            if bool(arbd.get("continuous_soc", True)):
+                                res = optimize_arbitrage_continuous(
+                                    prices_hourly_eur_per_kwh=ser,
+                                    cap_kwh=bat_kwh,
+                                    p_kw=bat_kw,
+                                    dod=float(arbd.get("dod", 0.90)),
+                                    roundtrip_eff=float(arbd.get("roundtrip_eff", 0.90)),
+                                    deg_cost_per_kwh_throughput=float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)),
+                                    soc_grid_points=int(arbd.get("soc_grid_points", 201)),
+                                    terminal_mode=str(arbd.get("terminal_mode", "End-SOC = SOC_min")),
+                                    terminal_value_eur_per_kwh=float(terminal_value),
+                                )
+                            else:
+                                res = optimize_arbitrage_daily_reset(
+                                    prices_hourly_eur_per_kwh=ser,
+                                    cap_kwh=bat_kwh,
+                                    p_kw=bat_kw,
+                                    dod=float(arbd.get("dod", 0.90)),
+                                    roundtrip_eff=float(arbd.get("roundtrip_eff", 0.90)),
+                                    deg_cost_per_kwh_throughput=float(arbd.get("degradation_eur_per_kwh_throughput", 0.03)),
+                                    soc_grid_points=int(arbd.get("soc_grid_points", 201)),
+                                )
+
+                            arbd["annual_profit_est"] = round(float(res["profit_year"]), 2)
+                            arbd["annual_throughput_kwh"] = round(float(res["throughput_year"]), 1)
+                            arbd["annual_cycles_est"] = round(float(res["cycles_year"]), 2)
+
+                            sched = res["schedule_df"]
+                            if not sched.empty:
+                                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                out = ARB_DIR / f"arb_schedule_{P_SLUG}_{ts}.csv"
+                                sched.to_csv(out, sep=";", decimal=",")
+                                arbd["schedule_file"] = str(out)
+
+                            st.success(
+                                f"Optimierung fertig: Profit ~ {arbd['annual_profit_est']:,.0f} €/a | "
+                                f"Cycles ~ {arbd['annual_cycles_est']:.1f}/a"
+                            )
+
+                            with st.expander("Preis-Preview (letzte 7 Tage)"):
+                                st.line_chart(ser.tail(24 * 7))
+
+                            if not sched.empty:
+                                with st.expander("Optimierter Plan (Auszug)"):
+                                    st.dataframe(sched.tail(96), use_container_width=True)
+                                    if arbd.get("schedule_file"):
+                                        st.code(arbd["schedule_file"])
+
+                    except Exception as e:
+                        st.error(str(e))
+
+                st.metric("Annual Profit Est (€/a)", f"{float(arbd.get('annual_profit_est', 0.0)):,.0f}")
+                cA, cB, cC = st.columns(3)
+                cA.metric("Annual Cycles Est", f"{float(arbd.get('annual_cycles_est', 0.0)):.1f}/a")
+                cB.metric("Annual Throughput", f"{float(arbd.get('annual_throughput_kwh', 0.0)):,.0f} kWh/a")
+                cC.metric("Quantil-Spread (Info)", f"{float(arbd.get('spread', 0.0)):.3f} €/kWh")
+
     ti += 1
 
 # ================================================================
-# TAB: E-MOBILITÄT (unverändert – bitte deinen bestehenden Tab einsetzen)
+# TAB: E-MOBILITÄT
 # ================================================================
 if "Ladeinfrastruktur" in d["scope"]:
     with tabs[ti]:
-        st.info("🔌 E‑Mobilität‑Tab: Bitte ersetze diesen Platzhalter durch deinen bestehenden E‑Mobilität‑Tab (aus deiner Version).")
+        st.header("🔌 E-Mobilität")
+
+        # ---------- Ladeinfrastruktur ----------
+        st.subheader("1) Ladeinfrastruktur (AC/DC, freie kW, Anzahl Punkte)")
+
+        cadd1, cadd2, cadd3 = st.columns([1, 1, 2])
+        with cadd1:
+            if st.button("➕ AC Gruppe"):
+                d["mobilität"]["ladepunkte"].append({
+                    "name": "AC Ladepunkt",
+                    "typ": "AC",
+                    "leistung_kw_pro_punkt": 11.0,
+                    "anzahl_punkte": 1,
+                    "datasheet": "",
+                })
+                st.rerun()
+        with cadd2:
+            if st.button("➕ DC Gruppe"):
+                d["mobilität"]["ladepunkte"].append({
+                    "name": "DC Charger",
+                    "typ": "DC",
+                    "leistung_kw_pro_punkt": 150.0,
+                    "anzahl_punkte": 1,
+                    "datasheet": "",
+                })
+                st.rerun()
+        with cadd3:
+            st.caption("Jede Zeile ist eine *Gruppe identischer Ladepunkte* (z. B. 8×11kW AC oder 2×300kW DC).")
+
+        if not d["mobilität"]["ladepunkte"]:
+            st.info("Noch keine Ladepunkt-Gruppen angelegt.")
+        else:
+            for i, lp in enumerate(list(d["mobilität"]["ladepunkte"])):
+                with st.container(border=True):
+                    c1, c2, c3, c4, c5 = st.columns([1.6, 0.7, 1, 1, 1])
+                    lp["name"] = c1.text_input("Name/Modell", lp.get("name", ""), key=f"lp_name_{i}")
+                    lp["typ"] = c2.selectbox("Typ", CHARGER_TYPES, index=safe_index(CHARGER_TYPES, lp.get("typ", "AC"), 0), key=f"lp_typ_{i}")
+                    lp["leistung_kw_pro_punkt"] = c3.number_input("kW je Ladepunkt", 0.0, 10_000.0, float(lp.get("leistung_kw_pro_punkt", 11.0) or 0.0), step=0.5, key=f"lp_kw_{i}")
+                    lp["anzahl_punkte"] = c4.number_input("Anzahl Ladepunkte", 1, 10_000, int(lp.get("anzahl_punkte", 1) or 1), key=f"lp_n_{i}")
+
+                    group_kw = float(lp["leistung_kw_pro_punkt"]) * float(lp["anzahl_punkte"])
+                    c5.metric("Gruppenleistung", f"{group_kw:.1f} kW")
+
+                    c6, c7 = st.columns([2.2, 0.8])
+                    with c6:
+                        up = st.file_uploader("Datenblatt (optional)", type=None, key=f"lp_ds_up_{i}")
+                        if up is not None:
+                            lp["datasheet"] = save_uploaded_file(DATASHEETS / "ladestationen", up, prefix="lp_")
+                            st.success("Gespeichert.")
+                        if lp.get("datasheet"):
+                            st.code(lp["datasheet"])
+                    with c7:
+                        if st.button("🗑️ Gruppe löschen", key=f"lp_del_{i}"):
+                            d["mobilität"]["ladepunkte"].pop(i)
+                            st.rerun()
+
+        # Summary AC/DC
+        ac_points = dc_points = 0
+        ac_kw = dc_kw = 0.0
+        for lp in d["mobilität"]["ladepunkte"]:
+            n = int(lp.get("anzahl_punkte", 1) or 1)
+            p = float(lp.get("leistung_kw_pro_punkt", 0.0) or 0.0)
+            if lp.get("typ") == "DC":
+                dc_points += n
+                dc_kw += p * n
+            else:
+                ac_points += n
+                ac_kw += p * n
+
+        csum1, csum2, csum3, csum4 = st.columns(4)
+        csum1.metric("AC Punkte", f"{ac_points}")
+        csum2.metric("AC kW gesamt", f"{ac_kw:.1f} kW")
+        csum3.metric("DC Punkte", f"{dc_points}")
+        csum4.metric("DC kW gesamt", f"{dc_kw:.1f} kW")
+
+        st.divider()
+
+        # ---------- Fuhrpark ----------
+        st.subheader("2) Fuhrpark (manuell oder KI-Durchschnitt für Diesel & kWh)")
+        if st.button("➕ Fahrzeuggruppe hinzufügen"):
+            d["mobilität"]["fuhrpark"].append({
+                "klasse": "PKW",
+                "anzahl": 1,
+                "km_pro_jahr": 20000,
+                "consumption_mode": "Manuell",
+                "kwh_pro_100km": 18.0,
+                "l_pro_100km": 7.0,
+                "datasheet": "",
+            })
+            st.rerun()
+
+        if not d["mobilität"]["fuhrpark"]:
+            st.info("Noch keine Fahrzeuge angelegt.")
+        else:
+            for i, fz in enumerate(list(d["mobilität"]["fuhrpark"])):
+                with st.container(border=True):
+                    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+                    fz["klasse"] = c1.selectbox("Klasse", FZ_KLASSEN, index=safe_index(FZ_KLASSEN, fz.get("klasse", "PKW"), 0), key=f"fz_k_{i}")
+                    fz["anzahl"] = c2.number_input("Stück", 1, 100000, int(fz.get("anzahl", 1) or 1), key=f"fz_a_{i}")
+                    fz["km_pro_jahr"] = c3.number_input("km/Jahr", 0, 5_000_000, int(fz.get("km_pro_jahr", 20000) or 0), step=500, key=f"fz_km_{i}")
+                    fz["consumption_mode"] = c4.selectbox("Verbrauch", CONSUMPTION_MODE, index=safe_index(CONSUMPTION_MODE, fz.get("consumption_mode", "Manuell"), 0), key=f"fz_mode_{i}")
+
+                    # KI-Durchschnitt übernehmen
+                    if fz["consumption_mode"].startswith("KI"):
+                        defaults = CONSUMPTION_DEFAULTS.get(fz["klasse"], CONSUMPTION_DEFAULTS["PKW"])
+                        st.info(f"KI-Mittelwerte für {fz['klasse']}: {defaults['kwh_per_100km']} kWh/100km | {defaults['l_per_100km']} L/100km")
+                        cbtn1, cbtn2 = st.columns([1, 3])
+                        if cbtn1.button("🤖 Werte übernehmen", key=f"fz_apply_ai_{i}"):
+                            fz["kwh_pro_100km"] = float(defaults["kwh_per_100km"])
+                            fz["l_pro_100km"] = float(defaults["l_per_100km"])
+                            st.rerun()
+                        with cbtn2:
+                            st.caption("Du kannst die Werte danach trotzdem manuell feinjustieren.")
+
+                    c5, c6, c7 = st.columns([1, 1, 1])
+                    fz["kwh_pro_100km"] = c5.number_input("kWh/100km (EV)", 0.0, 600.0, float(fz.get("kwh_pro_100km", 18.0) or 0.0), step=0.5, key=f"fz_ec_{i}")
+                    fz["l_pro_100km"] = c6.number_input("L/100km (Diesel)", 0.0, 120.0, float(fz.get("l_pro_100km", 7.0) or 0.0), step=0.1, key=f"fz_dc_{i}")
+
+                    with c7:
+                        if st.button("🗑️ Gruppe löschen", key=f"fz_del_{i}"):
+                            d["mobilität"]["fuhrpark"].pop(i)
+                            st.rerun()
+
+                    c8, c9 = st.columns([2.2, 0.8])
+                    with c8:
+                        up = st.file_uploader("Datenblatt Fahrzeug (optional)", type=None, key=f"fz_ds_up_{i}")
+                        if up is not None:
+                            fz["datasheet"] = save_uploaded_file(DATASHEETS / "fahrzeuge", up, prefix="fz_")
+                            st.success("Gespeichert.")
+                        if fz.get("datasheet"):
+                            st.code(fz["datasheet"])
+                    with c9:
+                        # Kosten-Preview
+                        strompreis = float(d["wirtschaft"].get("strompreis", 0.35))
+                        dieselpreis = float(d["wirtschaft"].get("dieselpreis", 1.70))
+                        km = float(fz.get("km_pro_jahr", 0) or 0)
+                        anz = float(fz.get("anzahl", 1) or 1)
+                        e = float(fz.get("kwh_pro_100km", 0) or 0)
+                        dl = float(fz.get("l_pro_100km", 0) or 0)
+                        ev_kwh = (km / 100.0) * e * anz
+                        di_l = (km / 100.0) * dl * anz
+                        save_yr = (di_l * dieselpreis) - (ev_kwh * strompreis)
+                        st.metric("Δ Energie €/a", f"{save_yr:,.0f}")
+
+        # Totals (EV demand)
+        strompreis = float(d["wirtschaft"].get("strompreis", 0.35))
+        dieselpreis = float(d["wirtschaft"].get("dieselpreis", 1.70))
+        ev_total = 0.0
+        savings = 0.0
+        for fz in d["mobilität"]["fuhrpark"]:
+            km = float(fz.get("km_pro_jahr", 0) or 0)
+            anz = float(fz.get("anzahl", 0) or 0)
+            e = float(fz.get("kwh_pro_100km", 0) or 0)
+            dl = float(fz.get("l_pro_100km", 0) or 0)
+            ev_kwh = (km / 100.0) * e * anz
+            di_l = (km / 100.0) * dl * anz
+            ev_total += ev_kwh
+            savings += (di_l * dieselpreis) - (ev_kwh * strompreis)
+
+        d["mobilität"]["total_ev_kwh"] = float(ev_total)
+
+        ctot1, ctot2 = st.columns(2)
+        ctot1.metric("EV-Strombedarf", f"{ev_total:,.0f} kWh/a")
+        ctot2.metric("Energiekosten-Delta", f"{savings:,.0f} €/a")
+
+        # HAK Check (PV-AC + Ladeleistung)
+        pv_ac = float(d["pv"].get("total_ac_kw", 0.0))
+        lade_kw_sum = ac_kw + dc_kw
+        if (pv_ac + lade_kw_sum) > hak_kw:
+            st.error(f"🚨 HAK-Konflikt: WR-AC {pv_ac:.1f} kW + Ladeleistung {lade_kw_sum:.1f} kW > HAK {hak_kw:.1f} kW")
+            st.info("➡️ Empfehlung: EMS/Lastmanagement + ggf. Anschlussleistung prüfen/beantragen.")
+        else:
+            st.success(f"✅ HAK ok: WR-AC {pv_ac:.1f} kW + Ladeleistung {lade_kw_sum:.1f} kW ≤ HAK {hak_kw:.1f} kW")
+
     ti += 1
 
 # ================================================================
@@ -2201,10 +2604,81 @@ with tabs[ti]:
 ti += 1
 
 # ================================================================
-# TAB: REPORT & DATEIEN (unverändert – in deiner Version vorhanden)
+# TAB: REPORT & DATEIEN + ZIP PACKAGE (mit index.html)
 # ================================================================
 with tabs[ti]:
-    st.info("🧾 Report‑Tab: Bitte ersetze diesen Platzhalter durch deinen bestehenden Report/ZIP‑Tab (aus deiner Version).")
+    st.header("🧾 Report & Dateien")
+
+    st.subheader("Report erzeugen (PDF/Word) → documents/reports/")
+    sim_kpis = st.session_state.get("_last_sim_kpis", {})
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("📄 Word-Report erzeugen", use_container_width=True):
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out = REPORTS / f"report_{P_SLUG}_{ts}.docx"
+                export_word(out, d, sim_kpis)
+                st.success(f"Erzeugt: {out}")
+            except Exception as e:
+                st.error(str(e))
+    with c2:
+        if st.button("🧾 PDF-Report erzeugen", use_container_width=True):
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out = REPORTS / f"report_{P_SLUG}_{ts}.pdf"
+                export_pdf(out, d, sim_kpis)
+                st.success(f"Erzeugt: {out}")
+            except Exception as e:
+                st.error(str(e))
+    with c3:
+        if st.button("📦 Bericht mit Anlagen (ZIP + Index.html) erstellen", use_container_width=True):
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                zip_out = REPORTS / f"package_{P_SLUG}_{ts}.zip"
+
+                idx_html = generate_index_html(P_SLUG, d, ts, DOCS)
+                files = gather_project_package_files(DOCS, STATE_FILE)
+                build_zip_package(zip_out, files, extra_bytes={"index.html": idx_html.encode("utf-8")})
+
+                st.success(f"Erzeugt: {zip_out}")
+                st.session_state["_last_zip"] = str(zip_out)
+            except Exception as e:
+                st.error(str(e))
+
+    if st.session_state.get("_last_zip"):
+        zp = Path(st.session_state["_last_zip"])
+        if zp.exists():
+            st.download_button(
+                "⬇️ ZIP downloaden",
+                data=zp.read_bytes(),
+                file_name=zp.name,
+                use_container_width=True,
+                key="dl_zip_quick",
+            )
+
+    st.divider()
+    st.subheader("Vorhandene Dateien (Download)")
+    files = sorted(list(DOCS.rglob("*.*")), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        st.info("Noch keine Dateien im documents/ Ordner.")
+    else:
+        for fp in files[:200]:
+            colA, colB = st.columns([3, 1])
+            with colA:
+                st.write(str(fp))
+            with colB:
+                try:
+                    data_b = fp.read_bytes()
+                    st.download_button(
+                        "Download",
+                        data=data_b,
+                        file_name=fp.name,
+                        use_container_width=True,
+                        key=f"dl_{str(fp)}",
+                    )
+                except Exception:
+                    pass
 
 # ================================================================
 # AUTOSAVE
