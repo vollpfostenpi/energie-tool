@@ -1,0 +1,66 @@
+import streamlit as st
+import plotly.express as px
+from datetime import datetime
+
+st.set_page_config(page_title="Experten-Bericht", layout="wide")
+
+if not st.session_state.get("active_project"):
+    st.error("Kein Projekt geladen.")
+    st.stop()
+
+data = st.session_state["projekt_daten"]
+p_name = st.session_state['project_name']
+
+st.title(f"📄 Experten-Bericht")
+st.subheader(f"Analyseergebnisse für {p_name}")
+
+# --- KENNZAHLEN ---
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("PV-Leistung", f"{data['total_kwp']} kWp")
+c2.metric("Speicher", f"{data['total_kwh']} kWh")
+c3.metric("Ladepunkte", f"{len(data['lade_punkte'])}")
+c4.metric("Lastgang", "Ja" if data['lastgang_vorhanden'] else "Standard")
+
+# --- ANALYSE-GRAFIKEN ---
+st.divider()
+st.subheader("📊 Ertrag & Eigenverbrauch")
+col_g1, col_g2 = st.columns(2)
+
+with col_g1:
+    # Beispielhafte Ertragsberechnung
+    labels = ['Eigenverbrauch', 'Einspeisung']
+    values = [data['total_kwp']*400, data['total_kwp']*600]
+    fig = px.pie(names=labels, values=values, hole=0.5, title="Energieverwendung")
+    st.plotly_chart(fig, use_container_width=True)
+    
+
+with col_g2:
+    # Wirtschaftlichkeitssimulation
+    jahre = list(range(1, 21))
+    cashflow = [- (data['total_kwp']*1200 + data['total_kwh']*600) + (i * data['total_kwp']*180) for i in jahre]
+    fig2 = px.line(x=jahre, y=cashflow, title="Kumulierter Cashflow über 20 Jahre", labels={'x':'Jahre', 'y':'Euro'})
+    fig2.add_hline(y=0, line_dash="dash", line_color="red")
+    st.plotly_chart(fig2, use_container_width=True)
+
+# --- RECHTLICHER CHECK (COMPLIANCE) ---
+st.divider()
+st.subheader("⚖️ Rechtliche & Gesetzliche Prüfung")
+
+# GEIG Prüfung
+if len(data['lade_punkte']) == 0:
+    st.error("🚨 **GEIG-Alarm:** Laut Gebäude-Elektromobilitätsinfrastruktur-Gesetz (GEIG) müssen Nicht-Wohngebäude ab 20 Stellplätzen Ladepunkte vorweisen. Ihre Planung enthält aktuell keine.")
+else:
+    st.success("✅ **GEIG-Check:** Ladeinfrastruktur ist in der Planung enthalten.")
+
+# EnWG Prüfung
+if data['total_kwh'] > 0:
+    st.info("**📌 EnWG §14a:** Da ein Speicher geplant ist, ist die Anlage als steuerbare Verbrauchseinrichtung anzumelden. Dies ermöglicht reduzierte Netzentgelte.")
+
+# EEG Hinweis
+if data['total_kwp'] > 25:
+    st.warning("**⚠️ EEG-Pflicht:** Über 25 kWp ist die Steuerbarkeit durch den Netzbetreiber (iMSys) zwingend.")
+
+# --- FOOTER & EXPORT ---
+st.divider()
+st.button("📥 PDF-Bericht generieren (Vollversion)")
+st.caption("Bericht erstellt am " + datetime.now().strftime("%d.%m.%Y") + " | Energy Expert Pro 2026")
