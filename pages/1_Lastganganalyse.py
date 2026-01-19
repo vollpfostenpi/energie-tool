@@ -84,19 +84,71 @@ def guess_value_col(cols, dt_col):
             return c
     return dt_col
 
+def _read_csv_with_encoding_fallback(file_obj, sep=None, decimal=None):
+    """
+    Robust gegen 'utf-8 codec can't decode ...' bei Windows/Excel CSV.
+    Versucht nacheinander encodings. Funktioniert für Path UND UploadedFile.
+    """
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+    last_err = None
+
+    # file_obj kann Path oder UploadedFile/BytesIO sein
+    if isinstance(file_obj, (str, Path)):
+        for enc in encodings:
+            try:
+                return pd.read_csv(
+                    file_obj,
+                    sep=sep,
+                    decimal=decimal,
+                    encoding=enc,
+                    engine="python" if sep is None else None,
+                    on_bad_lines="skip",
+                )
+            except Exception as e:
+                last_err = e
+        raise last_err
+
+    # UploadedFile: Bytes einmal holen und pro Versuch neu "öffnen"
+    content = file_obj.getvalue() if hasattr(file_obj, "getvalue") else file_obj.read()
+    for enc in encodings:
+        try:
+            bio = io.BytesIO(content)
+            return pd.read_csv(
+                bio,
+                sep=sep,
+                decimal=decimal,
+                encoding=enc,
+                engine="python" if sep is None else None,
+                on_bad_lines="skip",
+            )
+        except Exception as e:
+            last_err = e
+
+    # Fallback: decoding errors ersetzen
+    try:
+        text = content.decode("latin1", errors="replace")
+        return pd.read_csv(
+            io.StringIO(text),
+            sep=sep,
+            decimal=decimal,
+            engine="python" if sep is None else None,
+            on_bad_lines="skip",
+        )
+    except Exception as e:
+        raise e from last_err
+
 def read_profile_any(path_or_file, csv_sep=None, csv_decimal=None):
     name = getattr(path_or_file, "name", "")
     if isinstance(path_or_file, (str, Path)):
-        name = str(path_or_file)
         p = Path(path_or_file)
         if p.suffix.lower() == ".csv":
-            return pd.read_csv(p, sep=csv_sep, decimal=csv_decimal) if csv_sep else pd.read_csv(p, sep=None, engine="python", decimal=csv_decimal)
+            # sep=None -> auto sniffing
+            return _read_csv_with_encoding_fallback(p, sep=csv_sep, decimal=csv_decimal)
         return pd.read_excel(p)
     else:
+        # UploadedFile
         if name.lower().endswith(".csv"):
-            if csv_sep:
-                return pd.read_csv(path_or_file, sep=csv_sep, decimal=csv_decimal)
-            return pd.read_csv(path_or_file, sep=None, engine="python", decimal=csv_decimal)
+            return _read_csv_with_encoding_fallback(path_or_file, sep=csv_sep, decimal=csv_decimal)
         return pd.read_excel(path_or_file)
 
 def normalize_df(df: pd.DataFrame, dt_col: str, val_col: str, assume_kw=True):
@@ -132,80 +184,38 @@ def make_index(start_date: date, end_date: date, resolution: str):
     return idx
 
 def _daily_peaks(hour, peaks):
-    """peaks: list of (mu, sigma, amplitude)"""
     out = np.zeros_like(hour, dtype=float)
     for mu, sigma, amp in peaks:
         out += amp * np.exp(-0.5 * ((hour - mu) / sigma) ** 2)
     return out
 
 def _weekday_mask(idx: pd.DatetimeIndex, weekend_active: bool, sunday_active: bool):
-    wd = idx.dayofweek.values  # 0=Mon
+    wd = idx.dayofweek.values
     if weekend_active and sunday_active:
         return np.ones(len(idx), dtype=float)
     if weekend_active and not sunday_active:
-        return (wd <= 5).astype(float)  # Mon-Sat
+        return (wd <= 5).astype(float)
     if (not weekend_active) and sunday_active:
-        return np.ones(len(idx), dtype=float)  # selten, aber erlaubt
-    return (wd <= 4).astype(float)  # Mon-Fri
+        return np.ones(len(idx), dtype=float)
+    return (wd <= 4).astype(float)
 
 def ki_profile_gewerbe(idx: pd.DatetimeIndex, seed: int, branche: str, schicht: str,
                        weekend_active: bool, sunday_active: bool, seasonality_level: float = 0.08):
-    """
-    Erzeugt plausibles Gewerbeprofil:
-    - Branche beeinflusst Grundlast, Peakstruktur, Wochenendaktivität, Tagesgang
-    - Schichtsystem beeinflusst Laufzeitfenster
-    """
     rng = np.random.default_rng(seed)
     n = len(idx)
     hour = idx.hour.values + idx.minute.values / 60.0
     doy = idx.dayofyear.values
 
-    # --- Basisparameter je Branche ---
-    # base: Grundlastfaktor; peaks: (mu, sigma, amp); night_floor: Mindestbetrieb nachts
     presets = {
-        "Logistik/Lager": {
-            "base": 1.00,
-            "night_floor": 0.70,
-            "peaks": [(7.5, 1.3, 0.35), (15.5, 1.6, 0.25)],
-            "season_boost": 0.05,
-        },
-        "Maschinenbauer/Produktion": {
-            "base": 1.00,
-            "night_floor": 0.35,
-            "peaks": [(6.5, 1.2, 0.55), (13.0, 1.8, 0.35)],
-            "season_boost": 0.08,
-        },
-        "Lebensmittel/Verarbeitung": {
-            "base": 1.10,
-            "night_floor": 0.55,
-            "peaks": [(5.5, 1.4, 0.45), (12.5, 2.0, 0.35), (19.0, 1.8, 0.15)],
-            "season_boost": 0.10,
-        },
-        "Kälte/Frische/Logistik": {
-            "base": 1.15,
-            "night_floor": 0.80,
-            "peaks": [(8.0, 1.8, 0.18), (15.0, 2.2, 0.12)],
-            "season_boost": 0.18,
-        },
-        "Werkstatt/Handwerk": {
-            "base": 0.95,
-            "night_floor": 0.15,
-            "peaks": [(7.0, 1.1, 0.60), (12.0, 1.8, 0.25)],
-            "season_boost": 0.06,
-        },
-        "Büro/Verwaltung": {
-            "base": 0.85,
-            "night_floor": 0.05,
-            "peaks": [(9.5, 1.8, 0.65), (14.0, 1.8, 0.35)],
-            "season_boost": 0.04,
-        },
+        "Logistik/Lager": {"base": 1.00, "night_floor": 0.70, "peaks": [(7.5, 1.3, 0.35), (15.5, 1.6, 0.25)], "season_boost": 0.05},
+        "Maschinenbauer/Produktion": {"base": 1.00, "night_floor": 0.35, "peaks": [(6.5, 1.2, 0.55), (13.0, 1.8, 0.35)], "season_boost": 0.08},
+        "Lebensmittel/Verarbeitung": {"base": 1.10, "night_floor": 0.55, "peaks": [(5.5, 1.4, 0.45), (12.5, 2.0, 0.35), (19.0, 1.8, 0.15)], "season_boost": 0.10},
+        "Kälte/Frische/Logistik": {"base": 1.15, "night_floor": 0.80, "peaks": [(8.0, 1.8, 0.18), (15.0, 2.2, 0.12)], "season_boost": 0.18},
+        "Werkstatt/Handwerk": {"base": 0.95, "night_floor": 0.15, "peaks": [(7.0, 1.1, 0.60), (12.0, 1.8, 0.25)], "season_boost": 0.06},
+        "Büro/Verwaltung": {"base": 0.85, "night_floor": 0.05, "peaks": [(9.5, 1.8, 0.65), (14.0, 1.8, 0.35)], "season_boost": 0.04},
     }
-
     p = presets.get(branche, presets["Maschinenbauer/Produktion"])
 
-    # --- Schichtsystem -> aktive Stundenfenster ---
-    # Wir bauen daraus einen "activity" Faktor 0..1
-    # 1-Schicht: 06-18, 2-Schicht: 06-22, 3-Schicht: 24/7
     if schicht == "keine Angabe":
         schicht = "1-Schicht"
     if schicht == "1-Schicht":
@@ -214,35 +224,28 @@ def ki_profile_gewerbe(idx: pd.DatetimeIndex, seed: int, branche: str, schicht: 
     elif schicht == "2-Schicht":
         active = ((hour >= 6.0) & (hour < 22.0)).astype(float)
         active = 0.35 + 0.65 * active
-    else:  # 3-Schicht
+    else:
         active = np.ones(n, dtype=float) * 0.95
 
-    # --- Tagesgang: Grundlast + Peaks (branchenabhängig) ---
     peaks = _daily_peaks(hour, p["peaks"])
     daily = p["night_floor"] + (1.0 - p["night_floor"]) * active + peaks
 
-    # --- Wochenstruktur ---
     wmask = _weekday_mask(idx, weekend_active=weekend_active, sunday_active=sunday_active)
-    # am Wochenende ggf. nur Grundbetrieb
     daily = daily * (0.55 + 0.45 * wmask)
 
-    # --- Saison (z. B. Heizung/Kälte) ---
     seasonal = 1.0 + (seasonality_level + p["season_boost"]) * np.cos(2 * np.pi * (doy / 365.0))
     seasonal = np.clip(seasonal, 0.85, 1.25)
 
-    # --- Rauschen / Events ---
     noise = np.clip(rng.normal(1.0, 0.06, n), 0.75, 1.35)
 
-    # gelegentliche Kurzspitzen (z. B. Maschinenstart)
     spikes = np.zeros(n, dtype=float)
-    spike_count = int(n * 0.0025)  # ~0.25% der Zeit
+    spike_count = int(n * 0.0025)
     if spike_count > 0:
         pos = rng.integers(0, n, size=spike_count)
         spikes[pos] = rng.uniform(0.05, 0.25, size=spike_count)
 
     shape = (p["base"] * daily * seasonal * noise) * (1.0 + spikes)
-    shape = np.clip(shape, 0.02, None)
-    return shape
+    return np.clip(shape, 0.02, None)
 
 def ki_profile_maststall(idx: pd.DatetimeIndex, seed: int, phases: list[dict], summer_vent_boost: float = 0.35):
     rng = np.random.default_rng(seed + 42)
@@ -267,33 +270,23 @@ def ki_profile_maststall(idx: pd.DatetimeIndex, seed: int, phases: list[dict], s
         mask = (ts >= s) & (ts < e)
         if mask.any():
             phase_idx = np.where(mask)[0]
-            k = len(phase_idx)
-            ramp = np.linspace(0.75, 1.05, k)
+            ramp = np.linspace(0.75, 1.05, len(phase_idx))
             intensity[phase_idx] = inten * ramp
 
     noise = np.clip(rng.normal(1.0, 0.06, n), 0.80, 1.35)
-    shape = base * daily * seasonal * intensity * noise
-    shape = np.clip(shape, 0.05, None)
-    return shape
+    return np.clip(base * daily * seasonal * intensity * noise, 0.05, None)
 
 def scale_to_annual_kwh(idx: pd.DatetimeIndex, shape: np.ndarray, target_kwh: float):
-    if len(idx) < 2:
-        step_h = 1.0
-    else:
-        step_h = (idx[1] - idx[0]).total_seconds() / 3600.0
-
+    step_h = 1.0 if len(idx) < 2 else (idx[1] - idx[0]).total_seconds() / 3600.0
     raw_kwh = float(np.sum(shape) * step_h)
     scale = 0.0 if raw_kwh <= 0 else float(target_kwh) / raw_kwh
-
     kw = shape * scale
-    kwh_interval = kw * step_h
-    df = pd.DataFrame({"timestamp": idx, "kw": kw, "kwh_interval": kwh_interval})
-    return df, step_h
+    return pd.DataFrame({"timestamp": idx, "kw": kw, "kwh_interval": kw * step_h}), step_h
 
 def build_phases_auto(start: date, end: date, n_phases: int, phase_days: int, pause_days: int):
     phases = []
     cur = start
-    for i in range(n_phases):
+    for _ in range(n_phases):
         ph_start = cur
         ph_end = min(ph_start + timedelta(days=phase_days), end + timedelta(days=1))
         phases.append({"start": ph_start, "end": ph_end, "intensity": 1.0})
@@ -306,6 +299,8 @@ def build_phases_auto(start: date, end: date, n_phases: int, phase_days: int, pa
 # 6) Sidebar: Auswahl & Upload & KI
 # ============================================================
 st.sidebar.header("Daten-Einstellungen")
+st.sidebar.caption("CSV-Fix: unterstützt utf-8 / utf-8-sig / cp1252 / latin1 (Excel-ANSI).")
+
 source_option = st.sidebar.radio(
     "Datenquelle wählen:",
     ["Standard-Musterprofil", "Eigenes Profil hochladen", "KI-Lastgang generieren"],
@@ -323,19 +318,14 @@ with st.sidebar.expander("CSV-Optionen (optional)"):
     csv_sep = csv_sep if csv_sep.strip() else None
     csv_decimal = csv_decimal if csv_decimal.strip() else None
 
-# -------------------------
-# A) Musterprofile
-# -------------------------
 if source_option == "Standard-Musterprofil":
     if assets_path.exists():
-        muster_files = [f.name for f in assets_path.iterdir() if f.suffix.lower() in [".csv", ".xlsx", ".xls"]]
-        muster_files = sorted(muster_files)
+        muster_files = sorted([f.name for f in assets_path.iterdir() if f.suffix.lower() in [".csv", ".xlsx", ".xls"]])
         if muster_files:
             selected_muster = st.sidebar.selectbox("Muster auswählen:", muster_files, index=0)
-            full_path = assets_path / selected_muster
             selected_file_name = selected_muster
             try:
-                df_raw = read_profile_any(full_path, csv_sep=csv_sep, csv_decimal=csv_decimal)
+                df_raw = read_profile_any(assets_path / selected_muster, csv_sep=csv_sep, csv_decimal=csv_decimal)
             except Exception as e:
                 st.error(f"Fehler beim Laden des Musters: {e}")
         else:
@@ -343,9 +333,6 @@ if source_option == "Standard-Musterprofil":
     else:
         st.sidebar.error("Ordner 'assets/profiles' nicht gefunden.")
 
-# -------------------------
-# B) Upload
-# -------------------------
 elif source_option == "Eigenes Profil hochladen":
     uploaded_file = st.sidebar.file_uploader("Eigene Datei wählen", type=["csv", "xlsx", "xls"])
     if uploaded_file:
@@ -358,12 +345,8 @@ elif source_option == "Eigenes Profil hochladen":
     else:
         st.info("Bitte laden Sie eine Datei in der Sidebar hoch.")
 
-# -------------------------
-# C) KI Generator
-# -------------------------
 else:
     st.sidebar.subheader("KI-Lastgang Generator")
-
     resolution = st.sidebar.selectbox("Auflösung", ["15min", "hour"], index=0)
     year = st.sidebar.number_input("Jahr", min_value=2000, max_value=2100, value=2026, step=1)
 
@@ -375,16 +358,13 @@ else:
     target_kwh = st.sidebar.number_input("Energie im Zeitraum (kWh)", min_value=0.0, max_value=1e12, value=500000.0, step=1000.0, format="%.0f")
 
     profiltyp = st.sidebar.selectbox("Profiltyp", ["Gewerbe (KI)", "Landwirtschaft – Maststall"], index=0)
-
     seed = st.sidebar.number_input("Seed (optional)", min_value=0, max_value=999999, value=12345, step=1)
 
-    # Gewerbe-Inputs: Branche + Schichtsystem + Wochenende
     branche = "Maschinenbauer/Produktion"
     schicht = "1-Schicht"
     weekend_active = False
     sunday_active = False
     seasonality_level = 0.08
-
     phases = []
     summer_boost = 0.35
 
@@ -395,17 +375,11 @@ else:
             ["Logistik/Lager", "Maschinenbauer/Produktion", "Lebensmittel/Verarbeitung", "Kälte/Frische/Logistik", "Werkstatt/Handwerk", "Büro/Verwaltung"],
             index=1,
         )
-
-        schicht = st.sidebar.selectbox(
-            "Schichtsystem",
-            ["keine Angabe", "1-Schicht", "2-Schicht", "3-Schicht"],
-            index=1,
-        )
+        schicht = st.sidebar.selectbox("Schichtsystem", ["keine Angabe", "1-Schicht", "2-Schicht", "3-Schicht"], index=1)
 
         cW1, cW2 = st.sidebar.columns(2)
         weekend_active = cW1.checkbox("Samstag aktiv", value=(branche in ["Logistik/Lager", "Kälte/Frische/Logistik"]))
         sunday_active = cW2.checkbox("Sonntag aktiv", value=(branche in ["Kälte/Frische/Logistik"]))
-
         seasonality_level = st.sidebar.slider("Saison-Einfluss (Heizung/Kälte)", 0.0, 0.30, float(seasonality_level), 0.01)
 
     else:
@@ -416,25 +390,11 @@ else:
         summer_boost = st.sidebar.slider("Sommerlüftung-Boost", 0.0, 1.0, float(summer_boost), 0.05)
 
         auto_mode = st.sidebar.checkbox("Phasen automatisch verteilen", value=True)
-        if auto_mode:
-            phases = build_phases_auto(start_d, end_d, int(n_phases), int(phase_days), int(pause_days))
-            st.sidebar.caption(f"Erzeugt: {len(phases)} Phasen im Zeitraum")
-        else:
-            st.sidebar.info("Manuelle Phasen: pro Phase Start/Ende setzen.")
-            phases = []
-            for i in range(int(n_phases)):
-                s_i = st.sidebar.date_input(f"Phase {i+1} Start", value=start_d + timedelta(days=i*(phase_days+pause_days)), key=f"ph_s_{i}")
-                e_i = st.sidebar.date_input(f"Phase {i+1} Ende", value=min(s_i + timedelta(days=int(phase_days)), end_d), key=f"ph_e_{i}")
-                inten = st.sidebar.slider(f"Phase {i+1} Intensität", 0.2, 1.5, 1.0, 0.05, key=f"ph_int_{i}")
-                phases.append({"start": s_i, "end": e_i, "intensity": float(inten)})
+        phases = build_phases_auto(start_d, end_d, int(n_phases), int(phase_days), int(pause_days)) if auto_mode else phases
 
-    gen_btn = st.sidebar.button("🤖 KI Lastgang erzeugen", use_container_width=True)
-
-    if gen_btn and end_d >= start_d:
+    if st.sidebar.button("🤖 KI Lastgang erzeugen", use_container_width=True) and end_d >= start_d:
         idx = make_index(start_d, end_d, resolution)
-        if len(idx) < 2:
-            st.error("Zeitraum/Auflösung führt zu leerem Index.")
-        else:
+        if len(idx) >= 2:
             if profiltyp.startswith("Landwirtschaft"):
                 shape = ki_profile_maststall(idx, seed=int(seed), phases=phases, summer_vent_boost=float(summer_boost))
                 selected_file_name = f"KI_Maststall_{start_d}_{end_d}_{resolution}.csv"
@@ -449,9 +409,7 @@ else:
                     seasonality_level=float(seasonality_level),
                 )
                 selected_file_name = f"KI_Gewerbe_{branche.replace('/','-')}_{schicht}_{start_d}_{end_d}_{resolution}.csv"
-
-            df_gen, step_hours = scale_to_annual_kwh(idx, shape, float(target_kwh))
-            df_raw = df_gen.copy()
+            df_raw, step_hours = scale_to_annual_kwh(idx, shape, float(target_kwh))
 
 # ============================================================
 # 7) Anzeige & Analyse
@@ -460,7 +418,6 @@ if df_raw is not None:
     st.subheader(f"Aktives Profil: {selected_file_name or '—'}")
 
     cols = df_raw.columns.tolist()
-
     if "timestamp" in cols and ("kw" in cols or "kwh_interval" in cols):
         dt_guess = "timestamp"
         val_guess = "kw" if "kw" in cols else "kwh_interval"
@@ -474,7 +431,6 @@ if df_raw is not None:
         st.write("### Einstellungen")
         dt_col = st.selectbox("Zeitachse (X)", cols, index=cols.index(dt_guess) if dt_guess in cols else 0)
         y_col = st.selectbox("Wert (Y)", cols, index=cols.index(val_guess) if val_guess in cols else (1 if len(cols) > 1 else 0))
-
         assume_kw = st.radio("Interpretation Y", ["kW (Leistung)", "kWh/Intervall (Energie)"], index=0, horizontal=True) == "kW (Leistung)"
 
         try:
@@ -484,31 +440,18 @@ if df_raw is not None:
             df_norm = None
 
         if df_norm is not None and not df_norm.empty:
-            peak_kw = float(df_norm["kw"].max())
-            avg_kw = float(df_norm["kw"].mean())
-            energy_kwh = float(df_norm["kwh_interval"].sum())
-
-            st.metric("Spitzenlast", f"{peak_kw:,.2f} kW")
-            st.metric("Durchschnitt", f"{avg_kw:,.2f} kW")
-            st.metric("Energie im Zeitraum", f"{energy_kwh:,.0f} kWh")
-
-            with st.expander("Erweiterte Kennzahlen"):
-                st.write(f"- Schrittweite: **{step_hours:.2f} h**")
-                st.write(f"- Zeitraum: **{df_norm['timestamp'].min()}** bis **{df_norm['timestamp'].max()}**")
-                st.write(f"- Datenpunkte: **{len(df_norm):,}**")
-                st.write(f"- Tagesenergie (Ø): **{energy_kwh / max(df_norm['timestamp'].dt.date.nunique(),1):,.0f} kWh/Tag**")
+            st.metric("Spitzenlast", f"{float(df_norm['kw'].max()):,.2f} kW")
+            st.metric("Durchschnitt", f"{float(df_norm['kw'].mean()):,.2f} kW")
+            st.metric("Energie im Zeitraum", f"{float(df_norm['kwh_interval'].sum()):,.0f} kWh")
 
     with col1:
         if df_norm is not None and not df_norm.empty:
             plot_mode = st.radio("Plot", ["kW Verlauf", "kWh/Intervall Verlauf"], horizontal=True)
             y_plot = "kw" if plot_mode == "kW Verlauf" else "kwh_interval"
 
-            try:
-                fig = px.line(df_norm, x="timestamp", y=y_plot, title="Lastgang Verlauf")
-                fig.update_layout(hovermode="x unified", template="plotly_white", margin=dict(l=0, r=0, t=40, b=0))
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Grafik-Fehler: {e}")
+            fig = px.line(df_norm, x="timestamp", y=y_plot, title="Lastgang Verlauf")
+            fig.update_layout(hovermode="x unified", template="plotly_white", margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
 
             with st.expander("Tabellenansicht (normalisiert)"):
                 st.dataframe(df_norm.head(200), use_container_width=True)
